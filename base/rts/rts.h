@@ -19,6 +19,7 @@
 #endif
 
 #include "common.h"
+#include "actor_gc.h"
 #include "../builtin/builtin.h"
 
 #define MSGQ 2
@@ -232,11 +233,17 @@ void serialize_state_shortcut($Actor);
 
 #ifdef ACTON_THREADS
 #define GET_SELF() ($Actor)pthread_getspecific(self_key)
-#define SET_SELF(a) pthread_setspecific(self_key, (void *)a)
+#define SET_SELF(a) do { \
+    pthread_setspecific(self_key, (void *)(a)); \
+    actor_gc_set_current((a) ? actor_gc_lookup((void *)(a)) : NULL); \
+} while(0)
 #define GET_WTID() (int)pthread_getspecific(pkey_wtid);
 #else
 #define GET_SELF() self_actor
-#define SET_SELF(a) self_actor = a
+#define SET_SELF(a) do { \
+    self_actor = (a); \
+    actor_gc_set_current((a) ? actor_gc_lookup((void *)(a)) : NULL); \
+} while(0)
 #define GET_WTID() 0
 #endif
 

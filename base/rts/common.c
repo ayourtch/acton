@@ -1,4 +1,5 @@
 #include <stdlib.h>
+#include <string.h>
 #include <errno.h>
 
 #ifdef __linux__
@@ -11,6 +12,7 @@
 #include <tlsuv/tlsuv.h>
 
 #include "rts/common.h"
+#include "rts/actor_gc.h"
 
 #if defined(_WIN32) || defined(_WIN64)
 
@@ -114,7 +116,33 @@ void* acton_malloc_atomic(size_t size) {
     return acton__allocator.malloc_atomic(size);
 }
 
+// Allocate from per-actor arena if available, otherwise from Boehm atomic.
+// Use this ONLY for leaf objects that contain no outgoing GC pointers
+// (e.g., B_int, B_float — only have a static vtable pointer and scalar data).
+// Since leaf objects don't reference GC-managed memory, Boehm doesn't need
+// to scan them, and they don't need to be registered as roots.
+void* acton_malloc_leaf(size_t size) {
+    actor_gc_arena_t *arena = actor_gc_get_current();
+    if (arena) {
+        void *p = actor_gc_alloc(arena, size);
+        if (p) return p;
+    }
+    return acton__allocator.calloc(1, size);
+}
+
 void* acton_realloc(void* ptr, size_t size) {
+    // Safety: arena pointers must never be passed to GC_realloc.
+    // With leaf-only arena allocation, this shouldn't happen (leaf types
+    // don't use realloc), but guard against it.
+    if (ptr && actor_gc_is_arena_ptr(ptr)) {
+        void *boehm_ptr = acton__allocator.calloc(1, size);
+        if (boehm_ptr) {
+            size_t old_size = actor_gc_obj_size(ptr);
+            size_t copy_size = old_size < size ? old_size : size;
+            memcpy(boehm_ptr, ptr, copy_size);
+        }
+        return boehm_ptr;
+    }
     return acton__allocator.realloc(ptr, size);
 }
 

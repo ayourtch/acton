@@ -32,6 +32,8 @@ pub fn build(b: *std.Build) void {
     const cpedantic = b.option(bool, "cpedantic", "") orelse false;
     const use_db = b.option(bool, "db", "") orelse false;
     const no_threads = b.option(bool, "no_threads", "") orelse false;
+    const actor_gc = b.option(bool, "actor_gc", "Enable per-actor arena GC") orelse false;
+    const actor_gc_no_roots = b.option(bool, "actor_gc_no_roots", "Disable Boehm root scanning of arena") orelse false;
 
     const projpath_outtypes = joinPath(b.allocator, buildroot_path, "out/types");
 
@@ -233,6 +235,15 @@ pub fn build(b: *std.Build) void {
         };
     }
 
+    if (actor_gc) {
+        print("Per-actor arena GC enabled\n", .{});
+        flags.append(b.allocator, "-DACTON_ACTOR_GC") catch unreachable;
+    }
+    if (actor_gc_no_roots) {
+        print("Arena Boehm root scanning DISABLED (promote-on-flush only)\n", .{});
+        flags.append(b.allocator, "-DACTOR_GC_NO_ROOTS") catch unreachable;
+    }
+
     flags.appendSlice(b.allocator, &.{
         "-fno-sanitize=signed-integer-overflow",
     }) catch unreachable;
@@ -287,6 +298,7 @@ pub fn build(b: *std.Build) void {
     libActon.installHeader(b.path("rts/q.h"), "rts/q.h");
     libActon.installHeader(b.path("rts/rts.h"), "rts/rts.h");
     libActon.installHeader(b.path("rts/log.h"), "rts/log.h");
+    libActon.installHeader(b.path("rts/actor_gc.h"), "rts/actor_gc.h");
 
     libActon.addIncludePath(.{ .cwd_relative = buildroot_path });
     libActon.addIncludePath(dep_libtlsuv.path("include"));

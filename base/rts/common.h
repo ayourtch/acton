@@ -29,6 +29,7 @@ int acton_replace_allocator(acton_malloc_func malloc_func,
 
 void *acton_malloc(size_t size);
 void *acton_malloc_atomic(size_t size);
+void *acton_malloc_leaf(size_t size);  // Arena-safe: for objects with no outgoing GC pointers
 void *acton_realloc(void* ptr, size_t size);
 void *acton_calloc(size_t count, size_t size);
 void acton_free(void* ptr);

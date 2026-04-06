@@ -55,6 +55,8 @@
 #include "common.h"
 #include "common.c"
 
+#include "actor_gc.c"
+
 #include "yyjson.h"
 #include "rts.h"
 
@@ -386,6 +388,7 @@ void $ActorD___init__($Actor a) {
     atomic_flag_clear(&a->B_Msg_lock);
     a->$globkey = get_next_key();
     a->$affinity = SHARED_RQ;
+    actor_gc_register((void *)a);
     rtsd_printf("# New Actor %ld at %p of class %s", a->$globkey, a, a->$class->$GCINFO);
 }
 
@@ -966,6 +969,33 @@ void FLUSH_outgoing_db($Actor self, uuid_t *txnid) {
 }
 #endif
 
+// Promote any arena pointers in an outgoing message's continuation to Boehm.
+// This ensures the receiving actor doesn't hold references into the sender's arena.
+static void promote_outgoing_msg(B_Msg m) {
+    if (!m->$cont) return;
+
+    // If the continuation itself is in the arena, promote the whole thing
+    if (actor_gc_is_arena_ptr(m->$cont)) {
+        m->$cont = ($Cont)actor_gc_promote_one(m->$cont);
+    } else {
+        // Continuation is on Boehm, but may contain fields pointing to arena.
+        // Scan its contents for arena pointers.
+        void *base = GC_base(m->$cont);
+        if (base) {
+            size_t obj_size = GC_size(base);
+            size_t offset = (char *)m->$cont - (char *)base;
+            if (obj_size > offset) {
+                actor_gc_promote_region(m->$cont, obj_size - offset);
+            }
+        }
+    }
+
+    // Also promote the message's value if it's an arena pointer
+    if (m->value && actor_gc_is_arena_ptr(m->value)) {
+        m->value = ($WORD)actor_gc_promote_one(m->value);
+    }
+}
+
 // Actually send all buffered messages of the sender, using internal queues only
 // Assumes the actor's outgoing queue has already been reversed in FIFO order
 void FLUSH_outgoing_local($Actor self) {
@@ -975,6 +1005,12 @@ void FLUSH_outgoing_local($Actor self) {
     while (m) {
         B_Msg next = m->$next;
         m->$next = NULL;
+
+        // Promote arena pointers before delivering to another actor
+        if (m->$to != self) {
+            promote_outgoing_msg(m);
+        }
+
         long dest;
         if (m->$baseline == self->B_Msg->$baseline) {
             $Actor to = m->$to;
@@ -2323,6 +2359,9 @@ int main(int argc, char **argv) {
     GC_set_warn_proc(DaveNull);
     acton_init_alloc();
     acton_replace_allocator(GC_malloc, GC_malloc_atomic, GC_realloc, GC_calloc, acton_noop_free, GC_strdup, GC_strndup);
+    if (actor_gc_global_init(0) != 0) {
+        fprintf(stderr, "WARNING: actor_gc_global_init failed, falling back to Boehm-only\n");
+    }
     int ddb_no_host = 0;
     char **ddb_host = NULL;
     char *rts_host = "localhost";
