@@ -1,0 +1,107 @@
+# GC Benchmark - Elephant and Mice actors
+#
+# This benchmark stresses the garbage collector with two types of actors:
+# - Elephant actors: hold onto large amounts of memory (long-lived allocations)
+# - Mice actors: rapidly create and discard garbage (short-lived allocations)
+#
+# The mix is designed to stress GC with both long-lived and short-lived objects
+# coexisting, which is a common real-world pattern.
+
+import time
+
+# An Elephant holds onto a large list that persists for its lifetime,
+# and periodically churns part of it (simulating a cache or working set).
+actor Elephant(id: int, size: int, report: action(int, float) -> None):
+    var data: list[list[int]] = []
+    var rounds = 0
+
+    def setup():
+        # Build a large nested data structure
+        for i in range(size):
+            data.append([i * j for j in range(100)])
+
+    def churn():
+        # Replace a portion of the data, creating garbage from old entries
+        chunk = size // 10
+        start = (rounds * chunk) % size
+        for i in range(chunk):
+            idx = (start + i) % size
+            data[idx] = [idx * j + rounds for j in range(100)]
+        rounds += 1
+
+    def run(n: int):
+        sw = time.Stopwatch()
+        for i in range(n):
+            churn()
+        elapsed = sw.elapsed().to_float()
+        report(id, elapsed)
+
+    setup()
+
+# A Mouse rapidly allocates and discards data - pure garbage generation.
+actor Mouse(id: int, report: action(int, float) -> None):
+    var rounds = 0
+
+    def run(n: int):
+        sw = time.Stopwatch()
+        for i in range(n):
+            # Create various short-lived objects
+            garbage_list = [x * x for x in range(1000)]
+            garbage_dict: dict[str, int] = {}
+            for k in range(100):
+                garbage_dict[str(k)] = k * k
+            garbage_str = "hello " * 100
+            rounds += 1
+        elapsed = sw.elapsed().to_float()
+        report(id, elapsed)
+
+
+actor Coordinator(env, num_elephants: int, num_mice: int, elephant_size: int, rounds: int):
+    var results: list[str] = []
+    var pending = num_elephants + num_mice
+    var elephants: list[Elephant] = []
+    var mice: list[Mouse] = []
+    sw = time.Stopwatch()
+
+    def on_done(id: int, elapsed: float):
+        results.append("  Actor %d done in %.3f s" % (id, elapsed))
+        pending -= 1
+        if pending == 0:
+            finish()
+
+    def finish():
+        total_elapsed = sw.elapsed().to_float()
+        print("Individual results:")
+        for r in results:
+            print(r)
+        print("")
+        print("Total wall time: %.3f s" % total_elapsed)
+        print("Elephants: %d (each holding %d x 100 ints, churning 10%% per round)" % (num_elephants, elephant_size))
+        print("Mice: %d (each creating ~1000 ints + 100-entry dict + string per round)" % num_mice)
+        print("Rounds per actor: %d" % rounds)
+        env.exit(0)
+
+    # Warmup: create elephants first so they build up memory
+    print("Creating %d elephants (size=%d) and %d mice, %d rounds each..." % (num_elephants, elephant_size, num_mice, rounds))
+    for i in range(num_elephants):
+        e = Elephant(i, elephant_size, on_done)
+        elephants.append(e)
+    for i in range(num_mice):
+        m = Mouse(num_elephants + i, on_done)
+        mice.append(m)
+
+    # Kick off all actors
+    for e in elephants:
+        e.run(rounds)
+    for m in mice:
+        m.run(rounds)
+
+
+actor main(env):
+    # Default parameters - can be tuned
+    num_elephants = 4
+    num_mice = 8
+    elephant_size = 1000  # Each elephant holds 1000 x 100 = 100k ints
+    rounds = 400
+
+    Coordinator(env, num_elephants, num_mice, elephant_size, rounds)
