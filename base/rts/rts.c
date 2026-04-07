@@ -1033,10 +1033,11 @@ void FLUSH_outgoing_local($Actor self) {
         B_Msg next = m->$next;
         m->$next = NULL;
 
-        // Track cross-actor references (increment ext_refcount)
-        if (m->$to != self) {
-            track_outgoing_refs(m);
-        }
+        // Track cross-actor references (increment ext_refcount).
+        // Self-messages must also be tracked: the continuation in a self-message
+        // (e.g. the $AWAIT callback) is allocated in this actor's arena and must
+        // not be swept before the self-message is processed.
+        track_outgoing_refs(m);
 
         long dest;
         if (m->$baseline == self->B_Msg->$baseline) {
