@@ -289,14 +289,11 @@ void *actor_gc_realloc(actor_gc_arena_t *arena, void *old_ptr, size_t new_size) 
 
 // --- Sorted index for O(log n) pointer lookup ---
 
-// Comparison for qsort: sort index entries by payload_start
-static int index_entry_cmp(const void *a, const void *b) {
-    uintptr_t pa = ((const actor_gc_index_entry_t *)a)->payload_start;
-    uintptr_t pb = ((const actor_gc_index_entry_t *)b)->payload_start;
-    return (pa > pb) - (pa < pb);
-}
-
 // Build sorted index of all objects in the arena. Called once per collection.
+// Objects list is in reverse allocation order (newest first). Since bump
+// allocation produces monotonically increasing addresses, the list is in
+// descending address order. We populate the index and reverse it — O(n)
+// instead of O(n log n) qsort.
 static void build_object_index(actor_gc_arena_t *arena) {
     // Ensure capacity
     if (arena->num_objects > arena->index_cap) {
@@ -309,7 +306,7 @@ static void build_object_index(actor_gc_arena_t *arena) {
         arena->index_cap = new_cap;
     }
 
-    // Populate
+    // Populate (descending order from objects list)
     size_t i = 0;
     actor_gc_obj_t *obj = arena->objects;
     while (obj && i < arena->index_cap) {
@@ -322,8 +319,12 @@ static void build_object_index(actor_gc_arena_t *arena) {
     }
     arena->index_count = i;
 
-    // Sort by payload_start
-    qsort(arena->index, arena->index_count, sizeof(actor_gc_index_entry_t), index_entry_cmp);
+    // Reverse to ascending order — O(n) swap
+    for (size_t lo = 0, hi = i; lo + 1 < hi; lo++, hi--) {
+        actor_gc_index_entry_t tmp = arena->index[lo];
+        arena->index[lo] = arena->index[hi - 1];
+        arena->index[hi - 1] = tmp;
+    }
 }
 
 // Binary search: find the object whose payload range contains `ptr`.
