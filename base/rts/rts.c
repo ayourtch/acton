@@ -1702,7 +1702,10 @@ void wt_work_cb(uv_check_t *ev) {
                         if (_mb) { _roots[_nr++] = (actor_gc_root_t){_mb, GC_size(_mb)}; } \
                         _qm = _qm->$next; \
                     } \
+                    /* Validation roots = same message roots: catch mark-phase misses */ \
+                    actor_gc_set_val_roots(_roots + 1, _nr - 1); \
                     actor_gc_collect_full(_agc, _roots, _nr); \
+                    actor_gc_set_val_roots(NULL, 0); \
                 } \
             } \
         } while (0)

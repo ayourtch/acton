@@ -152,6 +152,12 @@ actor_gc_arena_t *actor_gc_get_current(void);
 // Call from sentinel detection to identify which arena swept the crashed object.
 void actor_gc_print_sweep_ring(void);
 
+// Set validation roots for the next actor_gc_collect_full call.
+// During sweep, each would-be-freed object is checked against these regions.
+// If found, the object is rescued (marked) and a diagnostic is printed.
+// Call with n=0 to disable (e.g. after collection completes).
+void actor_gc_set_val_roots(actor_gc_root_t *roots, int n);
+
 // --- Legacy promote API (kept for fallback) ---
 
 void actor_gc_promote_region(void *start, size_t size);

@@ -40,6 +40,21 @@ static actor_gc_arena_t *agc_sweep_ring_arena[AGC_SWEEP_RING_SIZE]; // owning ar
 static int    agc_sweep_ring_idx = 0;   // next write position (wraps mod SIZE)
 static int    agc_sweep_ring_total = 0; // total entries ever written
 
+// --- Diagnostic: pre-sweep validation roots ---
+// Set by rts.c before calling actor_gc_collect_full to validate the mark phase.
+// These are extra scanned regions (e.g. queued messages) checked during sweep:
+// if a would-be-swept object is found in any validation root, it means the
+// mark phase missed a reachable reference -- print a diagnostic and rescue it.
+#define AGC_MAX_VAL_ROOTS 256
+static __thread actor_gc_root_t agc_val_roots[AGC_MAX_VAL_ROOTS];
+static __thread int             agc_val_n = 0;
+
+void actor_gc_set_val_roots(actor_gc_root_t *roots, int n) {
+    int copy = n < AGC_MAX_VAL_ROOTS ? n : AGC_MAX_VAL_ROOTS;
+    for (int i = 0; i < copy; i++) agc_val_roots[i] = roots[i];
+    agc_val_n = copy;
+}
+
 void actor_gc_print_sweep_ring(void) {
     int n = agc_sweep_ring_total < AGC_SWEEP_RING_SIZE
             ? agc_sweep_ring_total : AGC_SWEEP_RING_SIZE;
@@ -703,6 +718,36 @@ void actor_gc_collect_full(actor_gc_arena_t *arena, actor_gc_root_t *roots, int 
             prev = &obj->next;
         } else {
             // Dead: unreachable locally, no foreign references.
+            // Pre-sweep validation: check if any validation root still references
+            // this payload. If so, the mark phase missed it — rescue and warn.
+            if (agc_val_n > 0 && obj->size >= sizeof(void *)) {
+                void *payload = actor_gc_payload(obj);
+                bool rescued = false;
+                for (int vi = 0; vi < agc_val_n && !rescued; vi++) {
+                    uintptr_t va = (uintptr_t)agc_val_roots[vi].start;
+                    uintptr_t ve = va + agc_val_roots[vi].size;
+                    va = (va + sizeof(void *) - 1) & ~(sizeof(void *) - 1);
+                    while (va + sizeof(void *) <= ve) {
+                        if (*(void **)va == payload) {
+                            fprintf(stderr,
+                                "AGC MARK-MISS: arena=%p payload=%p size=%u "
+                                "found in val_root[%d]=%p+%zu -- mark missed it!\n",
+                                (void *)arena, payload, obj->size,
+                                vi, agc_val_roots[vi].start, agc_val_roots[vi].size);
+                            obj->flags |= AGC_FLAG_MARK;  // rescue
+                            rescued = true;
+                            break;
+                        }
+                        va += sizeof(void *);
+                    }
+                }
+                if (rescued) {
+                    prev = &obj->next;
+                    obj = next;
+                    continue;
+                }
+            }
+
             // Remove from objects list and add to free list for reuse.
             *prev = next;
             freed += obj->size;
