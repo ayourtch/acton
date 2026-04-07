@@ -488,6 +488,13 @@ static bool mark_range(actor_gc_arena_t *arena, void *start, size_t size,
     uintptr_t end = addr + size;
     addr = (addr + sizeof(void *) - 1) & ~(sizeof(void *) - 1);
 
+    // Cache Boehm heap bounds for fast pre-filtering (avoids expensive GC_base calls).
+    // These are Boehm GC globals (declared in gc/gc_mark.h).
+    extern void *GC_least_plausible_heap_addr;
+    extern void *GC_greatest_plausible_heap_addr;
+    uintptr_t boehm_lo = (uintptr_t)GC_least_plausible_heap_addr;
+    uintptr_t boehm_hi = (uintptr_t)GC_greatest_plausible_heap_addr;
+
     while (addr + sizeof(void *) <= end) {
         uintptr_t candidate = *(uintptr_t *)addr;
 
@@ -507,12 +514,11 @@ static bool mark_range(actor_gc_arena_t *arena, void *start, size_t size,
                     (*arena_wl)[(*arena_wl_n)++] = (void *)obj;
                 }
             }
-        } else if (candidate > 0x1000) {
-            // Potential Boehm pointer: check and enqueue
+        } else if (candidate >= boehm_lo && candidate < boehm_hi) {
+            // Within Boehm heap bounds: worth calling GC_base
             void *gb = GC_base((void *)candidate);
             if (gb) {
                 // Proactively grow hash table if >50% full
-                // (boehm_wl_n ≈ number of unique Boehm objects seen so far)
                 if (*boehm_wl_n + 1 > *boehm_ht_cap / 2) {
                     if (!boehm_ht_grow(boehm_ht, boehm_ht_cap)) {
                         return false; // OOM
@@ -529,7 +535,6 @@ static bool mark_range(actor_gc_arena_t *arena, void *start, size_t size,
                     }
                     (*boehm_wl)[(*boehm_wl_n)++] = gb;
                 } else if (ins == -1) {
-                    // Table still full after grow attempt (OOM): count as overflow
                     (*boehm_ht_overflow)++;
                 }
             }
