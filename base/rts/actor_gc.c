@@ -30,44 +30,9 @@ static volatile char *bump_ptr = NULL;
 static volatile char *roots_registered_up_to = NULL;
 static int actor_gc_no_roots = 1;  // pin sets replace root scanning
 
-// --- Diagnostic: sweep ring buffer ---
-// Records the last N payload addresses written with sentinel (filled with 0xDEADB00F...)
-// so that when sentinel detection fires in rts.c we can see which objects were swept.
-#define AGC_SWEEP_RING_SIZE 64
-static void  *agc_sweep_ring[AGC_SWEEP_RING_SIZE];
-static actor_gc_arena_t *agc_sweep_ring_arena[AGC_SWEEP_RING_SIZE]; // owning arena
-static int    agc_sweep_ring_idx = 0;   // next write position (wraps mod SIZE)
-static int    agc_sweep_ring_total = 0; // total entries ever written
-
-// --- Diagnostic: pre-sweep validation roots ---
-// Set by rts.c before calling actor_gc_collect_full to validate the mark phase.
-// These are extra scanned regions (e.g. queued messages) checked during sweep:
-// if a would-be-swept object is found in any validation root, it means the
-// mark phase missed a reachable reference -- print a diagnostic and rescue it.
-#define AGC_MAX_VAL_ROOTS 256
-static __thread actor_gc_root_t agc_val_roots[AGC_MAX_VAL_ROOTS];
-static __thread int             agc_val_n = 0;
-
-void actor_gc_set_val_roots(actor_gc_root_t *roots, int n) {
-    int copy = n < AGC_MAX_VAL_ROOTS ? n : AGC_MAX_VAL_ROOTS;
-    for (int i = 0; i < copy; i++) agc_val_roots[i] = roots[i];
-    agc_val_n = copy;
-}
-
-void actor_gc_print_sweep_ring(void) {
-    int n = agc_sweep_ring_total < AGC_SWEEP_RING_SIZE
-            ? agc_sweep_ring_total : AGC_SWEEP_RING_SIZE;
-    fprintf(stderr, "AGC sweep ring: last %d swept objects (total=%d):\n", n, agc_sweep_ring_total);
-    // Print from oldest to newest
-    int start = (agc_sweep_ring_total < AGC_SWEEP_RING_SIZE)
-                ? 0 : agc_sweep_ring_idx; // oldest slot
-    for (int i = 0; i < n; i++) {
-        int s = (start + i) % AGC_SWEEP_RING_SIZE;
-        fprintf(stderr, "  [%d] payload=%p arena=%p\n",
-                agc_sweep_ring_total - n + i,
-                agc_sweep_ring[s], (void *)agc_sweep_ring_arena[s]);
-    }
-}
+// Stubs for diagnostic APIs (callers in rts.c still reference these)
+void actor_gc_set_val_roots(actor_gc_root_t *roots, int n) { (void)roots; (void)n; }
+void actor_gc_print_sweep_ring(void) {}
 
 // --- Thread-local current arena ---
 
@@ -277,40 +242,6 @@ static void *region_bump_alloc(size_t total_size) {
 // If this value is not seen when reusing, something wrote to a freed block.
 #define AGC_FREELIST_SENTINEL 0xDEADB00FDEADBA11ULL
 
-// Validate free list and objects list integrity. Call after alloc/sweep for debugging.
-static void __attribute__((unused)) actor_gc_validate_lists(actor_gc_arena_t *arena, const char *where) {
-    // Cycle detection in objects list (Floyd's algorithm)
-    actor_gc_obj_t *slow = arena->objects, *fast = arena->objects;
-    int steps = 0;
-    while (fast && fast->next) {
-        slow = slow->next;
-        fast = fast->next->next;
-        steps++;
-        if (slow == fast) {
-            fprintf(stderr, "AGC VALIDATE [%s]: CYCLE in objects list after %d steps!\n", where, steps);
-            abort();
-        }
-        if (steps > 10000000) {
-            fprintf(stderr, "AGC VALIDATE [%s]: objects list too long (>10M), possible cycle\n", where);
-            abort();
-        }
-    }
-    // Cycle detection in free list
-    slow = arena->free_list; fast = arena->free_list; steps = 0;
-    while (fast && fast->next) {
-        slow = slow->next;
-        fast = fast->next->next;
-        steps++;
-        if (slow == fast) {
-            fprintf(stderr, "AGC VALIDATE [%s]: CYCLE in free_list after %d steps!\n", where, steps);
-            abort();
-        }
-        if (steps > 10000000) {
-            fprintf(stderr, "AGC VALIDATE [%s]: free_list too long (>10M)\n", where);
-            abort();
-        }
-    }
-}
 
 void *actor_gc_alloc(actor_gc_arena_t *arena, size_t size) {
     if (!region_base) return NULL;
@@ -698,18 +629,7 @@ void actor_gc_collect_full(actor_gc_arena_t *arena, actor_gc_root_t *roots, int 
         arena->limbo_bytes = 0;
     }
 
-    // Phase 0b: Count actual objects (num_objects can drift if underflow guard fires)
-    // and build sorted index for O(log n) pointer lookup.
-    {
-        size_t actual_count = 0;
-        actor_gc_obj_t *p = arena->objects;
-        while (p) { actual_count++; p = p->next; }
-        if (actual_count != arena->num_objects) {
-            fprintf(stderr, "AGC COUNT MISMATCH arena=%p: num_objects=%zu actual=%zu (correcting)\n",
-                    (void *)arena, arena->num_objects, actual_count);
-            arena->num_objects = actual_count;
-        }
-    }
+    // Phase 0b: Build sorted index for O(log n) pointer lookup.
     build_object_index(arena);
     if (arena->index_count == 0) return;  // OOM or empty
 
@@ -727,48 +647,15 @@ void actor_gc_collect_full(actor_gc_arena_t *arena, actor_gc_root_t *roots, int 
     actor_gc_obj_t **prev = &arena->objects;
     obj = arena->objects;
     size_t freed = 0, freed_count = 0;
-    size_t marked_count = 0, extref_count = 0;
 
     while (obj) {
         actor_gc_obj_t *next = obj->next;
         if (obj->flags & AGC_FLAG_MARK) {
-            marked_count++;
             prev = &obj->next;
         } else if (__sync_fetch_and_add(&obj->ext_refcount, 0) > 0) {
-            extref_count++;
             prev = &obj->next;
         } else {
             // Dead: unreachable locally, no foreign references.
-            // Pre-sweep validation: check if any validation root still references
-            // this payload. If so, the mark phase missed it — rescue and warn.
-            if (agc_val_n > 0 && obj->size >= sizeof(void *)) {
-                void *payload = actor_gc_payload(obj);
-                bool rescued = false;
-                for (int vi = 0; vi < agc_val_n && !rescued; vi++) {
-                    uintptr_t va = (uintptr_t)agc_val_roots[vi].start;
-                    uintptr_t ve = va + agc_val_roots[vi].size;
-                    va = (va + sizeof(void *) - 1) & ~(sizeof(void *) - 1);
-                    while (va + sizeof(void *) <= ve) {
-                        if (*(void **)va == payload) {
-                            fprintf(stderr,
-                                "AGC MARK-MISS: arena=%p payload=%p size=%u "
-                                "found in val_root[%d]=%p+%zu -- mark missed it!\n",
-                                (void *)arena, payload, obj->size,
-                                vi, agc_val_roots[vi].start, agc_val_roots[vi].size);
-                            obj->flags |= AGC_FLAG_MARK;  // rescue
-                            rescued = true;
-                            break;
-                        }
-                        va += sizeof(void *);
-                    }
-                }
-                if (rescued) {
-                    prev = &obj->next;
-                    obj = next;
-                    continue;
-                }
-            }
-
             // Remove from objects list and add to limbo (deferred free).
             // Objects go to limbo first, then get promoted to free_list
             // on the NEXT collection cycle. This ensures any concurrent
@@ -797,10 +684,6 @@ void actor_gc_collect_full(actor_gc_arena_t *arena, actor_gc_root_t *roots, int 
             arena->collect_threshold = INITIAL_THRESHOLD;
     }
 
-    // Uncomment for debug:
-    // fprintf(stderr, "AGC[%p] #%zu: %zu marked, %zu swept, %zu live (%zu B)\n",
-    //         (void *)arena, arena->collections, marked_count, freed_count,
-    //         arena->num_objects, arena->total_bytes);
 }
 
 // --- Cross-actor reference tracking ---
