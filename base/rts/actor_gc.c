@@ -31,6 +31,30 @@ static volatile char *roots_registered_up_to = NULL;
 // Default: root scanning ON (all-in arena needs it for Boehm pointer safety)
 static int actor_gc_no_roots = 0;
 
+// --- Diagnostic: sweep ring buffer ---
+// Records the last N payload addresses written with sentinel (filled with 0xDEADB00F...)
+// so that when sentinel detection fires in rts.c we can see which objects were swept.
+#define AGC_SWEEP_RING_SIZE 64
+static void  *agc_sweep_ring[AGC_SWEEP_RING_SIZE];
+static actor_gc_arena_t *agc_sweep_ring_arena[AGC_SWEEP_RING_SIZE]; // owning arena
+static int    agc_sweep_ring_idx = 0;   // next write position (wraps mod SIZE)
+static int    agc_sweep_ring_total = 0; // total entries ever written
+
+void actor_gc_print_sweep_ring(void) {
+    int n = agc_sweep_ring_total < AGC_SWEEP_RING_SIZE
+            ? agc_sweep_ring_total : AGC_SWEEP_RING_SIZE;
+    fprintf(stderr, "AGC sweep ring: last %d swept objects (total=%d):\n", n, agc_sweep_ring_total);
+    // Print from oldest to newest
+    int start = (agc_sweep_ring_total < AGC_SWEEP_RING_SIZE)
+                ? 0 : agc_sweep_ring_idx; // oldest slot
+    for (int i = 0; i < n; i++) {
+        int s = (start + i) % AGC_SWEEP_RING_SIZE;
+        fprintf(stderr, "  [%d] payload=%p arena=%p\n",
+                agc_sweep_ring_total - n + i,
+                agc_sweep_ring[s], (void *)agc_sweep_ring_arena[s]);
+    }
+}
+
 // --- Thread-local current arena ---
 
 static __thread actor_gc_arena_t *current_arena = NULL;
@@ -428,25 +452,53 @@ static inline actor_gc_obj_t *index_lookup(actor_gc_arena_t *arena, uintptr_t pt
 // This handles all transitions: root→arena, root→Boehm, arena→Boehm, Boehm→arena.
 
 // Open-addressing hash table for visited Boehm base pointers.
-// Returns true if base was newly inserted (not yet visited).
-static inline bool boehm_ht_insert(void **ht, int ht_cap, void *base) {
+// Returns:  1 = newly inserted (not yet visited)
+//           0 = already in table (duplicate)
+//          -1 = table completely full (overflow — caller must grow and retry)
+static inline int boehm_ht_insert(void **ht, int ht_cap, void *base) {
     uintptr_t h = ((uintptr_t)base >> 3) * 2654435761ULL;
     unsigned slot = (unsigned)(h & (unsigned)(ht_cap - 1));
     for (unsigned i = 0; i < (unsigned)ht_cap; i++) {
         unsigned s = (slot + i) & (unsigned)(ht_cap - 1);
-        if (ht[s] == NULL) { ht[s] = base; return true; }
-        if (ht[s] == base) { return false; }
+        if (ht[s] == NULL) { ht[s] = base; return 1; }
+        if (ht[s] == base) { return 0; }
     }
-    return false;  // table full: treat as visited (conservative)
+    return -1;  // table full: overflow
+}
+
+// Rehash boehm_ht into a table of double capacity.
+// Returns true on success, false on OOM (old table left unchanged).
+static bool boehm_ht_grow(void ***ht_ptr, int *cap_ptr) {
+    int old_cap = *cap_ptr;
+    int new_cap = old_cap * 2;
+    void **new_ht = (void **)calloc(new_cap, sizeof(void *));
+    if (!new_ht) return false;
+    void **old_ht = *ht_ptr;
+    for (int i = 0; i < old_cap; i++) {
+        if (!old_ht[i]) continue;
+        void *base = old_ht[i];
+        uintptr_t h = ((uintptr_t)base >> 3) * 2654435761ULL;
+        unsigned slot = (unsigned)(h & (unsigned)(new_cap - 1));
+        for (unsigned j = 0; j < (unsigned)new_cap; j++) {
+            unsigned s = (slot + j) & (unsigned)(new_cap - 1);
+            if (new_ht[s] == NULL) { new_ht[s] = base; break; }
+        }
+    }
+    free(old_ht);
+    *ht_ptr = new_ht;
+    *cap_ptr = new_cap;
+    return true;
 }
 
 // Unified mark phase: scan range for arena ptrs (mark+queue) and Boehm ptrs (queue).
 // arena_wl/boehm_wl are dynamic worklists passed in/out.
+// boehm_ht is passed as void*** so it can be grown in place if it gets too full.
 // Returns false on OOM (caller should fall back to simple scan).
 static bool mark_range(actor_gc_arena_t *arena, void *start, size_t size,
                         void ***arena_wl, int *arena_wl_n, int *arena_wl_cap,
                         void ***boehm_wl, int *boehm_wl_n, int *boehm_wl_cap,
-                        void **boehm_ht, int boehm_ht_cap) {
+                        void ***boehm_ht, int *boehm_ht_cap,
+                        int *boehm_ht_overflow) {
     uintptr_t addr = (uintptr_t)start;
     uintptr_t end = addr + size;
     addr = (addr + sizeof(void *) - 1) & ~(sizeof(void *) - 1);
@@ -460,28 +512,29 @@ static bool mark_range(actor_gc_arena_t *arena, void *start, size_t size,
             if (obj && !(obj->flags & AGC_FLAG_MARK)) {
                 obj->flags |= AGC_FLAG_MARK;
                 if (!(obj->flags & AGC_FLAG_LEAF)) {
-                    // Push payload onto arena worklist
+                    // Push obj ptr onto arena worklist (dequeue reads payload+size)
                     if (*arena_wl_n >= *arena_wl_cap) {
                         int nc = *arena_wl_cap * 2;
                         void **nw = (void **)realloc(*arena_wl, nc * sizeof(void *));
                         if (!nw) return false;
                         *arena_wl = nw; *arena_wl_cap = nc;
                     }
-                    (*arena_wl)[(*arena_wl_n)++] = actor_gc_payload(obj);
-                    // Store size after the payload ptr (interleaved: ptr, size, ptr, size...)
-                    // Actually, store as two consecutive slots. Use double-width.
-                    // Simpler: just store the obj ptr and compute payload+size on dequeue.
-                    // Actually we already stored the payload ptr; we need the size.
-                    // Let me store the OBJ ptr, not payload, so we can get both.
-                    // Revert: store obj ptr instead of payload ptr
-                    (*arena_wl)[(*arena_wl_n) - 1] = (void *)obj;
+                    (*arena_wl)[(*arena_wl_n)++] = (void *)obj;
                 }
             }
         } else if (candidate > 0x1000) {
             // Potential Boehm pointer: check and enqueue
             void *gb = GC_base((void *)candidate);
             if (gb) {
-                if (boehm_ht_insert(boehm_ht, boehm_ht_cap, gb)) {
+                // Proactively grow hash table if >50% full
+                // (boehm_wl_n ≈ number of unique Boehm objects seen so far)
+                if (*boehm_wl_n + 1 > *boehm_ht_cap / 2) {
+                    if (!boehm_ht_grow(boehm_ht, boehm_ht_cap)) {
+                        return false; // OOM
+                    }
+                }
+                int ins = boehm_ht_insert(*boehm_ht, *boehm_ht_cap, gb);
+                if (ins == 1) {
                     // Newly visited: push to Boehm worklist
                     if (*boehm_wl_n >= *boehm_wl_cap) {
                         int nc = *boehm_wl_cap * 2;
@@ -490,6 +543,9 @@ static bool mark_range(actor_gc_arena_t *arena, void *start, size_t size,
                         *boehm_wl = nw; *boehm_wl_cap = nc;
                     }
                     (*boehm_wl)[(*boehm_wl_n)++] = gb;
+                } else if (ins == -1) {
+                    // Table still full after grow attempt (OOM): count as overflow
+                    (*boehm_ht_overflow)++;
                 }
             }
         }
@@ -500,9 +556,10 @@ static bool mark_range(actor_gc_arena_t *arena, void *start, size_t size,
 
 static void mark_from_roots_bfs(actor_gc_arena_t *arena,
                                   actor_gc_root_t *roots, int num_roots) {
-    // Boehm visited hash table
-    int boehm_ht_cap = 2048;
+    // Boehm visited hash table — starts small, grows dynamically (see mark_range)
+    int boehm_ht_cap = 512;
     void **boehm_ht = (void **)calloc(boehm_ht_cap, sizeof(void *));
+    int boehm_ht_overflow = 0;  // count of OOM-overflow events (should stay 0)
 
     // Arena worklist: obj ptrs waiting to have their payloads scanned
     int arena_wl_cap = 512;
@@ -540,7 +597,7 @@ static void mark_from_roots_bfs(actor_gc_arena_t *arena,
         if (!mark_range(arena, roots[i].start, roots[i].size,
                         &arena_wl, &arena_wl_n, &arena_wl_cap,
                         &boehm_wl, &boehm_wl_n, &boehm_wl_cap,
-                        boehm_ht, boehm_ht_cap)) goto cleanup;
+                        &boehm_ht, &boehm_ht_cap, &boehm_ht_overflow)) goto cleanup;
     }
 
     // Process arena and Boehm worklists interleaved
@@ -551,7 +608,7 @@ static void mark_from_roots_bfs(actor_gc_arena_t *arena,
             if (!mark_range(arena, actor_gc_payload(obj), obj->size,
                             &arena_wl, &arena_wl_n, &arena_wl_cap,
                             &boehm_wl, &boehm_wl_n, &boehm_wl_cap,
-                            boehm_ht, boehm_ht_cap)) goto cleanup;
+                            &boehm_ht, &boehm_ht_cap, &boehm_ht_overflow)) goto cleanup;
         }
         // Process one Boehm object (which may enqueue more arena/Boehm objects)
         if (boehm_wl_head < boehm_wl_n) {
@@ -560,8 +617,14 @@ static void mark_from_roots_bfs(actor_gc_arena_t *arena,
             if (!mark_range(arena, base, bsz,
                             &arena_wl, &arena_wl_n, &arena_wl_cap,
                             &boehm_wl, &boehm_wl_n, &boehm_wl_cap,
-                            boehm_ht, boehm_ht_cap)) goto cleanup;
+                            &boehm_ht, &boehm_ht_cap, &boehm_ht_overflow)) goto cleanup;
         }
+    }
+
+    if (boehm_ht_overflow > 0) {
+        fprintf(stderr, "AGC BUG: boehm_ht overflow %d time(s) during BFS "
+                "(final cap=%d, boehm_unique=%d) — objects may have been missed!\n",
+                boehm_ht_overflow, boehm_ht_cap, boehm_wl_n);
     }
 
 cleanup:
@@ -648,7 +711,13 @@ void actor_gc_collect_full(actor_gc_arena_t *arena, actor_gc_root_t *roots, int 
 
             // Write sentinel to payload for corruption detection on reuse
             if (obj->size >= sizeof(uint64_t)) {
-                *(uint64_t *)actor_gc_payload(obj) = AGC_FREELIST_SENTINEL;
+                void *payload = actor_gc_payload(obj);
+                // Log to sweep ring buffer before overwriting
+                agc_sweep_ring[agc_sweep_ring_idx] = payload;
+                agc_sweep_ring_arena[agc_sweep_ring_idx] = arena;
+                agc_sweep_ring_idx = (agc_sweep_ring_idx + 1) % AGC_SWEEP_RING_SIZE;
+                agc_sweep_ring_total++;
+                *(uint64_t *)payload = AGC_FREELIST_SENTINEL;
             }
 
             // Prepend to free list (LIFO — matches LIFO alloc for cache warmth)

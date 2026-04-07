@@ -1621,6 +1621,7 @@ void wt_work_cb(uv_check_t *ev) {
                 actor_gc_obj_t *hdr = (actor_gc_obj_t *)((char*)cont - sizeof(actor_gc_obj_t));
                 fprintf(stderr, "  hdr: owner=%p size=%u flags=%x ext_refcount=%u\n",
                         (void*)hdr->owner, hdr->size, hdr->flags, hdr->ext_refcount);
+                actor_gc_print_sweep_ring();
                 abort();
             }
         }
@@ -1661,6 +1662,51 @@ void wt_work_cb(uv_check_t *ev) {
             r = $R_FAIL(ex);
         }
 
+        // Compute GC root for this actor before the switch.
+        // Used in $RDONE/$RFAIL to run GC before ENQ_ready.
+        void *_gc_actor_base = (void *)current;
+        void *_gc_boehm_base = GC_base(_gc_actor_base);
+        void *_gc_root_start = NULL;
+        size_t _gc_root_size = 0;
+        {
+            actor_gc_arena_t *_gc_arena = actor_gc_get_current();
+            if (_gc_arena) {
+                if (_gc_boehm_base) {
+                    size_t _asz = GC_size(_gc_boehm_base);
+                    size_t _off = (char *)_gc_actor_base - (char *)_gc_boehm_base;
+                    _gc_root_start = _gc_actor_base;
+                    _gc_root_size = (_asz > _off) ? _asz - _off : 0;
+                } else if (actor_gc_is_arena_ptr(_gc_actor_base)) {
+                    actor_gc_obj_t *_hdr = actor_gc_header(_gc_actor_base);
+                    _gc_root_start = _gc_actor_base;
+                    _gc_root_size = _hdr->size;
+                }
+            }
+        }
+
+        // Helper macro: run GC after DEQ_msg but before ENQ_ready.
+        #define MAX_GC_ROOTS 256
+        // At this call site the actor is still exclusively on this thread.
+        // current->B_Msg already points to the next queued message (post-dequeue).
+        #define ACTOR_GC_COLLECT_NOW() do { \
+            actor_gc_arena_t *_agc = actor_gc_get_current(); \
+            if (_agc && _gc_root_size > 0) { \
+                actor_gc_update_foreign_refs(_agc, _gc_root_start, _gc_root_size); \
+                if (_agc->total_bytes > _agc->collect_threshold) { \
+                    actor_gc_root_t _roots[MAX_GC_ROOTS]; \
+                    int _nr = 0; \
+                    _roots[_nr++] = (actor_gc_root_t){_gc_root_start, _gc_root_size}; \
+                    B_Msg _qm = current->B_Msg; \
+                    while (_qm && _nr < MAX_GC_ROOTS) { \
+                        void *_mb = GC_base(_qm); \
+                        if (_mb) { _roots[_nr++] = (actor_gc_root_t){_mb, GC_size(_mb)}; } \
+                        _qm = _qm->$next; \
+                    } \
+                    actor_gc_collect_full(_agc, _roots, _nr); \
+                } \
+            } \
+        } while (0)
+
         switch (r.tag) {
         case $RDONE: {
             save_actor_state(current, m);
@@ -1675,8 +1721,12 @@ void wt_work_cb(uv_check_t *ev) {
                 b = c;
             }
             rtsd_printf("## DONE actor %ld : %s", current->$globkey, current->$class->$GCINFO);
-            if (DEQ_msg(current)) {
-                ENQ_ready(current);
+            {
+                bool _has_more = DEQ_msg(current);
+                ACTOR_GC_COLLECT_NOW();  // GC before ENQ_ready to avoid race
+                if (_has_more) {
+                    ENQ_ready(current);
+                }
             }
             break;
         }
@@ -1716,8 +1766,12 @@ void wt_work_cb(uv_check_t *ev) {
                     rtsd_printf("## Propagating exception to actor %ld : %s", b->$globkey, b->$class->$GCINFO);
                     b = c;
                 }
-                if (DEQ_msg(current)) {
-                    ENQ_ready(current);
+                {
+                    bool _has_more = DEQ_msg(current);
+                    ACTOR_GC_COLLECT_NOW();  // GC before ENQ_ready to avoid race
+                    if (_has_more) {
+                        ENQ_ready(current);
+                    }
                 }
                 rtsd_printf("## Done handling failed actor %ld : %s", current->$globkey, current->$class->$GCINFO);
             }
@@ -1771,60 +1825,7 @@ void wt_work_cb(uv_check_t *ev) {
         }
         }
 
-        // Per-actor GC: update foreign refs and optionally collect
-        // Only on message completion ($RDONE/$RFAIL), not mid-continuation ($RCONT)
-        if (r.tag == $RDONE || r.tag == $RFAIL) {
-            actor_gc_arena_t *arena = actor_gc_get_current();
-            if (arena) {
-                // Get actor struct for scanning.
-                // The actor struct may be Boehm-allocated (if it was created
-                // before any arena was active) OR arena-allocated (if created
-                // while another actor's arena was current).
-                void *actor_base = (void *)current;
-                void *gc_base_ptr = GC_base(actor_base);
-                // Determine root: prefer Boehm base (contains full struct);
-                // if arena-allocated, use the struct directly with its own size.
-                void *root_start;
-                size_t root_size;
-                if (gc_base_ptr) {
-                    size_t actor_size = GC_size(gc_base_ptr);
-                    size_t offset = (char *)actor_base - (char *)gc_base_ptr;
-                    root_start = actor_base;
-                    root_size = (actor_size > offset) ? actor_size - offset : 0;
-                } else if (actor_gc_is_arena_ptr(actor_base)) {
-                    // Arena-allocated actor struct: use its GC header to get size
-                    actor_gc_obj_t *hdr = actor_gc_header(actor_base);
-                    root_start = actor_base;
-                    root_size = hdr->size;
-                } else {
-                    root_start = NULL;
-                    root_size = 0;
-                }
-
-                if (root_size > 0) {
-                    // Update foreign reference tracking
-                    actor_gc_update_foreign_refs(arena, root_start, root_size);
-
-                    // Collect if over threshold
-                    if (arena->total_bytes > arena->collect_threshold) {
-                        // Build roots: actor struct + every queued B_Msg.
-                        #define MAX_GC_ROOTS 256
-                        actor_gc_root_t roots[MAX_GC_ROOTS];
-                        int num_roots = 0;
-                        roots[num_roots++] = (actor_gc_root_t){root_start, root_size};
-                        B_Msg qmsg = current->B_Msg;
-                        while (qmsg && num_roots < MAX_GC_ROOTS) {
-                            void *mb = GC_base(qmsg);
-                            if (mb) {
-                                roots[num_roots++] = (actor_gc_root_t){mb, GC_size(mb)};
-                            }
-                            qmsg = qmsg->$next;
-                        }
-                        actor_gc_collect_full(arena, roots, num_roots);
-                    }
-                }
-            }
-        }
+        #undef ACTOR_GC_COLLECT_NOW
 
         SET_SELF(NULL);
 

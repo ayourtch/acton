@@ -146,6 +146,12 @@ void actor_gc_unregister(void *actor_ptr);
 void actor_gc_set_current(actor_gc_arena_t *arena);
 actor_gc_arena_t *actor_gc_get_current(void);
 
+// --- Diagnostics ---
+
+// Print the sweep ring buffer (last N swept payload addresses) to stderr.
+// Call from sentinel detection to identify which arena swept the crashed object.
+void actor_gc_print_sweep_ring(void);
+
 // --- Legacy promote API (kept for fallback) ---
 
 void actor_gc_promote_region(void *start, size_t size);
