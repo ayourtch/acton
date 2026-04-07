@@ -1611,6 +1611,19 @@ void wt_work_cb(uv_check_t *ev) {
         volatile B_Msg m = current->B_Msg;
         $Cont cont = m->$cont;
         $WORD val = m->value;
+        // DEBUG: detect swept continuations before they crash
+        if (cont && actor_gc_is_arena_ptr(cont)) {
+            uint64_t first = *(uint64_t *)cont;
+            if (first == 0xDEADB00FDEADBA11ULL) {
+                fprintf(stderr, "AGC BUG: actor=%p cont=%p is SWEPT (sentinel)! m=%p arena=%p\n",
+                        (void*)current, (void*)cont, (void*)m, (void*)actor_gc_get_current());
+                // Print cont header
+                actor_gc_obj_t *hdr = (actor_gc_obj_t *)((char*)cont - sizeof(actor_gc_obj_t));
+                fprintf(stderr, "  hdr: owner=%p size=%u flags=%x ext_refcount=%u\n",
+                        (void*)hdr->owner, hdr->size, hdr->flags, hdr->ext_refcount);
+                abort();
+            }
+        }
 
         uv_clock_gettime(UV_CLOCK_MONOTONIC, &ts1);
         wt_stats[wctx->id].state = WT_Working;
@@ -1763,21 +1776,51 @@ void wt_work_cb(uv_check_t *ev) {
         if (r.tag == $RDONE || r.tag == $RFAIL) {
             actor_gc_arena_t *arena = actor_gc_get_current();
             if (arena) {
-                // Get actor struct size for scanning
+                // Get actor struct for scanning.
+                // The actor struct may be Boehm-allocated (if it was created
+                // before any arena was active) OR arena-allocated (if created
+                // while another actor's arena was current).
                 void *actor_base = (void *)current;
                 void *gc_base_ptr = GC_base(actor_base);
+                // Determine root: prefer Boehm base (contains full struct);
+                // if arena-allocated, use the struct directly with its own size.
+                void *root_start;
+                size_t root_size;
                 if (gc_base_ptr) {
                     size_t actor_size = GC_size(gc_base_ptr);
                     size_t offset = (char *)actor_base - (char *)gc_base_ptr;
-                    if (actor_size > offset) {
-                        // Update foreign reference tracking
-                        actor_gc_update_foreign_refs(arena, actor_base, actor_size - offset);
-                    }
+                    root_start = actor_base;
+                    root_size = (actor_size > offset) ? actor_size - offset : 0;
+                } else if (actor_gc_is_arena_ptr(actor_base)) {
+                    // Arena-allocated actor struct: use its GC header to get size
+                    actor_gc_obj_t *hdr = actor_gc_header(actor_base);
+                    root_start = actor_base;
+                    root_size = hdr->size;
+                } else {
+                    root_start = NULL;
+                    root_size = 0;
+                }
+
+                if (root_size > 0) {
+                    // Update foreign reference tracking
+                    actor_gc_update_foreign_refs(arena, root_start, root_size);
 
                     // Collect if over threshold
                     if (arena->total_bytes > arena->collect_threshold) {
-                        actor_gc_root_t roots[1] = {{actor_base, actor_size - offset}};
-                        actor_gc_collect_full(arena, roots, 1);
+                        // Build roots: actor struct + every queued B_Msg.
+                        #define MAX_GC_ROOTS 256
+                        actor_gc_root_t roots[MAX_GC_ROOTS];
+                        int num_roots = 0;
+                        roots[num_roots++] = (actor_gc_root_t){root_start, root_size};
+                        B_Msg qmsg = current->B_Msg;
+                        while (qmsg && num_roots < MAX_GC_ROOTS) {
+                            void *mb = GC_base(qmsg);
+                            if (mb) {
+                                roots[num_roots++] = (actor_gc_root_t){mb, GC_size(mb)};
+                            }
+                            qmsg = qmsg->$next;
+                        }
+                        actor_gc_collect_full(arena, roots, num_roots);
                     }
                 }
             }

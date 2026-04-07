@@ -228,14 +228,90 @@ static void *region_bump_alloc(size_t total_size) {
 
 // --- Allocation: free list + bump ---
 
+// Sentinel written to payload of free-list blocks for corruption detection.
+// If this value is not seen when reusing, something wrote to a freed block.
+#define AGC_FREELIST_SENTINEL 0xDEADB00FDEADBA11ULL
+
+// Validate free list and objects list integrity. Call after alloc/sweep for debugging.
+static void __attribute__((unused)) actor_gc_validate_lists(actor_gc_arena_t *arena, const char *where) {
+    // Cycle detection in objects list (Floyd's algorithm)
+    actor_gc_obj_t *slow = arena->objects, *fast = arena->objects;
+    int steps = 0;
+    while (fast && fast->next) {
+        slow = slow->next;
+        fast = fast->next->next;
+        steps++;
+        if (slow == fast) {
+            fprintf(stderr, "AGC VALIDATE [%s]: CYCLE in objects list after %d steps!\n", where, steps);
+            abort();
+        }
+        if (steps > 10000000) {
+            fprintf(stderr, "AGC VALIDATE [%s]: objects list too long (>10M), possible cycle\n", where);
+            abort();
+        }
+    }
+    // Cycle detection in free list
+    slow = arena->free_list; fast = arena->free_list; steps = 0;
+    while (fast && fast->next) {
+        slow = slow->next;
+        fast = fast->next->next;
+        steps++;
+        if (slow == fast) {
+            fprintf(stderr, "AGC VALIDATE [%s]: CYCLE in free_list after %d steps!\n", where, steps);
+            abort();
+        }
+        if (steps > 10000000) {
+            fprintf(stderr, "AGC VALIDATE [%s]: free_list too long (>10M)\n", where);
+            abort();
+        }
+    }
+}
+
 void *actor_gc_alloc(actor_gc_arena_t *arena, size_t size) {
     if (!region_base) return NULL;
 
     size_t aligned_size = ALIGN_UP(size, ARENA_ALIGN);
     size_t total = sizeof(actor_gc_obj_t) + aligned_size;
 
-    // Free list reuse disabled — see TODO in sweep phase.
-    // All allocations come from the bump pointer.
+    // 1. Try free list (head-only, LIFO): reuse if head block is large enough.
+    // CRITICAL: must increment num_objects on reuse so build_object_index
+    // sizes the index correctly. Under-counting causes index truncation,
+    // missing objects, missed marks, and incorrect sweep of live objects.
+    actor_gc_obj_t *blk = arena->free_list;
+    if (blk && blk->size >= aligned_size) {
+        // Remove from free list
+        arena->free_list = blk->next;
+        arena->free_bytes -= blk->size;
+
+        // Validate sentinel: if corrupted, something wrote to a freed block
+        if (blk->size >= sizeof(uint64_t)) {
+            uint64_t sentinel = *(uint64_t *)actor_gc_payload(blk);
+            if (sentinel != AGC_FREELIST_SENTINEL) {
+                fprintf(stderr, "AGC: free list sentinel CORRUPTED at %p: got %llx want %llx\n",
+                        (void *)blk, (unsigned long long)sentinel,
+                        (unsigned long long)AGC_FREELIST_SENTINEL);
+                abort();
+            }
+        }
+
+        // Reinitialize header. Keep blk->size at the original physical size
+        // (not shrinking to aligned_size) so the index entry covers the full
+        // block and scan_range_mark doesn't miss pointers in the extra space.
+        uint32_t reuse_size = blk->size;  // physical size; >= aligned_size guaranteed
+        blk->owner = arena;
+        blk->flags = 0;
+        blk->ext_refcount = 0;
+
+        // Insert at head of objects list
+        blk->next = arena->objects;
+        arena->objects = blk;
+        arena->total_bytes += reuse_size;
+        arena->num_objects++;  // MUST increment: used by build_object_index for capacity
+
+        void *payload = actor_gc_payload(blk);
+        memset(payload, 0, reuse_size);
+        return payload;
+    }
 
     // 2. Bump allocate from global region
     void *block = region_bump_alloc(total);
@@ -334,12 +410,167 @@ static inline actor_gc_obj_t *index_lookup(actor_gc_arena_t *arena, uintptr_t pt
 
 // --- Conservative mark phase ---
 //
-// The mark phase scans memory for arena pointers. Arena→arena chains
-// are followed recursively. Boehm objects in the ROOT (actor struct)
-// are followed one level deep to bridge the gap (e.g., B_Msg on Boehm
-// contains $cont on arena).
+// Mark phase must find ALL arena pointers reachable from GC roots, including
+// those behind mixed arena→Boehm→arena and Boehm→arena chains. The typical
+// problematic chain is:
+//
+//   actor struct (Boehm)
+//     → elephants: B_list (ARENA - allocated via acton_malloc)
+//       → data: $WORD* (ARENA - data array also via acton_malloc)
+//         → Elephant ptr (BOEHM - actor struct is GC_malloc)
+//           → report: $action (ARENA - callback closure in owner's arena)
+//
+// We use a unified worklist approach: both arena objects and Boehm objects
+// are queued for scanning. For each range scanned:
+//   - arena pointers: mark them, push payload to arena worklist
+//   - Boehm pointers: push base to Boehm worklist (visited tracking via hash table)
+//
+// This handles all transitions: root→arena, root→Boehm, arena→Boehm, Boehm→arena.
 
-// Arena-only scan: follows arena pointers, ignores everything else.
+// Open-addressing hash table for visited Boehm base pointers.
+// Returns true if base was newly inserted (not yet visited).
+static inline bool boehm_ht_insert(void **ht, int ht_cap, void *base) {
+    uintptr_t h = ((uintptr_t)base >> 3) * 2654435761ULL;
+    unsigned slot = (unsigned)(h & (unsigned)(ht_cap - 1));
+    for (unsigned i = 0; i < (unsigned)ht_cap; i++) {
+        unsigned s = (slot + i) & (unsigned)(ht_cap - 1);
+        if (ht[s] == NULL) { ht[s] = base; return true; }
+        if (ht[s] == base) { return false; }
+    }
+    return false;  // table full: treat as visited (conservative)
+}
+
+// Unified mark phase: scan range for arena ptrs (mark+queue) and Boehm ptrs (queue).
+// arena_wl/boehm_wl are dynamic worklists passed in/out.
+// Returns false on OOM (caller should fall back to simple scan).
+static bool mark_range(actor_gc_arena_t *arena, void *start, size_t size,
+                        void ***arena_wl, int *arena_wl_n, int *arena_wl_cap,
+                        void ***boehm_wl, int *boehm_wl_n, int *boehm_wl_cap,
+                        void **boehm_ht, int boehm_ht_cap) {
+    uintptr_t addr = (uintptr_t)start;
+    uintptr_t end = addr + size;
+    addr = (addr + sizeof(void *) - 1) & ~(sizeof(void *) - 1);
+
+    while (addr + sizeof(void *) <= end) {
+        uintptr_t candidate = *(uintptr_t *)addr;
+
+        if (candidate >= (uintptr_t)region_base && candidate < (uintptr_t)region_end) {
+            // Arena pointer: mark and queue payload for further scanning
+            actor_gc_obj_t *obj = index_lookup(arena, candidate);
+            if (obj && !(obj->flags & AGC_FLAG_MARK)) {
+                obj->flags |= AGC_FLAG_MARK;
+                if (!(obj->flags & AGC_FLAG_LEAF)) {
+                    // Push payload onto arena worklist
+                    if (*arena_wl_n >= *arena_wl_cap) {
+                        int nc = *arena_wl_cap * 2;
+                        void **nw = (void **)realloc(*arena_wl, nc * sizeof(void *));
+                        if (!nw) return false;
+                        *arena_wl = nw; *arena_wl_cap = nc;
+                    }
+                    (*arena_wl)[(*arena_wl_n)++] = actor_gc_payload(obj);
+                    // Store size after the payload ptr (interleaved: ptr, size, ptr, size...)
+                    // Actually, store as two consecutive slots. Use double-width.
+                    // Simpler: just store the obj ptr and compute payload+size on dequeue.
+                    // Actually we already stored the payload ptr; we need the size.
+                    // Let me store the OBJ ptr, not payload, so we can get both.
+                    // Revert: store obj ptr instead of payload ptr
+                    (*arena_wl)[(*arena_wl_n) - 1] = (void *)obj;
+                }
+            }
+        } else if (candidate > 0x1000) {
+            // Potential Boehm pointer: check and enqueue
+            void *gb = GC_base((void *)candidate);
+            if (gb) {
+                if (boehm_ht_insert(boehm_ht, boehm_ht_cap, gb)) {
+                    // Newly visited: push to Boehm worklist
+                    if (*boehm_wl_n >= *boehm_wl_cap) {
+                        int nc = *boehm_wl_cap * 2;
+                        void **nw = (void **)realloc(*boehm_wl, nc * sizeof(void *));
+                        if (!nw) return false;
+                        *boehm_wl = nw; *boehm_wl_cap = nc;
+                    }
+                    (*boehm_wl)[(*boehm_wl_n)++] = gb;
+                }
+            }
+        }
+        addr += sizeof(void *);
+    }
+    return true;
+}
+
+static void mark_from_roots_bfs(actor_gc_arena_t *arena,
+                                  actor_gc_root_t *roots, int num_roots) {
+    // Boehm visited hash table
+    int boehm_ht_cap = 2048;
+    void **boehm_ht = (void **)calloc(boehm_ht_cap, sizeof(void *));
+
+    // Arena worklist: obj ptrs waiting to have their payloads scanned
+    int arena_wl_cap = 512;
+    void **arena_wl = (void **)malloc(arena_wl_cap * sizeof(void *));
+    int arena_wl_head = 0, arena_wl_n = 0;
+
+    // Boehm worklist: base ptrs waiting to be scanned
+    int boehm_wl_cap = 512;
+    void **boehm_wl = (void **)malloc(boehm_wl_cap * sizeof(void *));
+    int boehm_wl_head = 0, boehm_wl_n = 0;
+
+    if (!boehm_ht || !arena_wl || !boehm_wl) {
+        // OOM fallback: simple arena-only scan
+        for (int i = 0; i < num_roots; i++) {
+            uintptr_t addr = (uintptr_t)roots[i].start;
+            uintptr_t end = addr + roots[i].size;
+            addr = (addr + sizeof(void*)-1) & ~(sizeof(void*)-1);
+            while (addr + sizeof(void*) <= end) {
+                uintptr_t c = *(uintptr_t *)addr;
+                if (c >= (uintptr_t)region_base && c < (uintptr_t)region_end) {
+                    actor_gc_obj_t *obj = index_lookup(arena, c);
+                    if (obj && !(obj->flags & AGC_FLAG_MARK)) {
+                        obj->flags |= AGC_FLAG_MARK;
+                        // no further scanning in fallback
+                    }
+                }
+                addr += sizeof(void*);
+            }
+        }
+        goto cleanup;
+    }
+
+    // Seed from roots
+    for (int i = 0; i < num_roots; i++) {
+        if (!mark_range(arena, roots[i].start, roots[i].size,
+                        &arena_wl, &arena_wl_n, &arena_wl_cap,
+                        &boehm_wl, &boehm_wl_n, &boehm_wl_cap,
+                        boehm_ht, boehm_ht_cap)) goto cleanup;
+    }
+
+    // Process arena and Boehm worklists interleaved
+    while (arena_wl_head < arena_wl_n || boehm_wl_head < boehm_wl_n) {
+        // Drain arena worklist
+        while (arena_wl_head < arena_wl_n) {
+            actor_gc_obj_t *obj = (actor_gc_obj_t *)arena_wl[arena_wl_head++];
+            if (!mark_range(arena, actor_gc_payload(obj), obj->size,
+                            &arena_wl, &arena_wl_n, &arena_wl_cap,
+                            &boehm_wl, &boehm_wl_n, &boehm_wl_cap,
+                            boehm_ht, boehm_ht_cap)) goto cleanup;
+        }
+        // Process one Boehm object (which may enqueue more arena/Boehm objects)
+        if (boehm_wl_head < boehm_wl_n) {
+            void *base = boehm_wl[boehm_wl_head++];
+            size_t bsz = GC_size(base);
+            if (!mark_range(arena, base, bsz,
+                            &arena_wl, &arena_wl_n, &arena_wl_cap,
+                            &boehm_wl, &boehm_wl_n, &boehm_wl_cap,
+                            boehm_ht, boehm_ht_cap)) goto cleanup;
+        }
+    }
+
+cleanup:
+    free(boehm_ht);
+    free(arena_wl);
+    free(boehm_wl);
+}
+
+// Simple arena-only scan (used by arena→arena following within scan_range_mark)
 static void scan_range_mark(actor_gc_arena_t *arena, void *start, size_t size) {
     uintptr_t addr = (uintptr_t)start;
     uintptr_t end = addr + size;
@@ -361,61 +592,6 @@ static void scan_range_mark(actor_gc_arena_t *arena, void *start, size_t size) {
     }
 }
 
-// Root scan: like scan_range_mark but also follows Boehm pointers one level
-// deep. This bridges actor struct → B_Msg (Boehm) → $cont (arena).
-// Boehm objects found here are scanned with arena-only scan_range_mark
-// (no further Boehm following to avoid cascading into the global heap).
-static void scan_roots_mark(actor_gc_arena_t *arena, void *start, size_t size) {
-    // First pass: find and mark arena pointers (same as scan_range_mark)
-    // Second concern: follow Boehm pointers one level deep
-
-    // Collect Boehm objects to scan (small fixed-size buffer)
-    #define MAX_BOEHM_ROOTS 64
-    void *boehm_bases[MAX_BOEHM_ROOTS];
-    size_t boehm_sizes[MAX_BOEHM_ROOTS];
-    int boehm_count = 0;
-
-    uintptr_t addr = (uintptr_t)start;
-    uintptr_t end = addr + size;
-    addr = (addr + sizeof(void *) - 1) & ~(sizeof(void *) - 1);
-
-    while (addr + sizeof(void *) <= end) {
-        uintptr_t candidate = *(uintptr_t *)addr;
-
-        if (candidate >= (uintptr_t)region_base && candidate < (uintptr_t)region_end) {
-            // Arena pointer — mark and recursively scan
-            actor_gc_obj_t *obj = index_lookup(arena, candidate);
-            if (obj && !(obj->flags & AGC_FLAG_MARK)) {
-                obj->flags |= AGC_FLAG_MARK;
-                if (!(obj->flags & AGC_FLAG_LEAF)) {
-                    scan_range_mark(arena, actor_gc_payload(obj), obj->size);
-                }
-            }
-        } else if (candidate > 0x1000 && boehm_count < MAX_BOEHM_ROOTS) {
-            // Potential Boehm pointer — collect for one-level scan
-            void *base = GC_base((void *)candidate);
-            if (base) {
-                // Check for duplicates
-                bool dup = false;
-                for (int i = 0; i < boehm_count; i++) {
-                    if (boehm_bases[i] == base) { dup = true; break; }
-                }
-                if (!dup) {
-                    boehm_bases[boehm_count] = base;
-                    boehm_sizes[boehm_count] = GC_size(base);
-                    boehm_count++;
-                }
-            }
-        }
-        addr += sizeof(void *);
-    }
-
-    // Now scan collected Boehm objects (arena-only, no further Boehm following)
-    for (int i = 0; i < boehm_count; i++) {
-        scan_range_mark(arena, boehm_bases[i], boehm_sizes[i]);
-    }
-}
-
 // --- Full collection with ext_refcount ---
 
 void actor_gc_collect_full(actor_gc_arena_t *arena, actor_gc_root_t *roots, int num_roots) {
@@ -423,7 +599,18 @@ void actor_gc_collect_full(actor_gc_arena_t *arena, actor_gc_root_t *roots, int 
 
     arena->collections++;
 
-    // Phase 0: Build sorted index for O(log n) pointer lookup
+    // Phase 0: Count actual objects (num_objects can drift if underflow guard fires)
+    // and build sorted index for O(log n) pointer lookup.
+    {
+        size_t actual_count = 0;
+        actor_gc_obj_t *p = arena->objects;
+        while (p) { actual_count++; p = p->next; }
+        if (actual_count != arena->num_objects) {
+            fprintf(stderr, "AGC COUNT MISMATCH arena=%p: num_objects=%zu actual=%zu (correcting)\n",
+                    (void *)arena, arena->num_objects, actual_count);
+            arena->num_objects = actual_count;
+        }
+    }
     build_object_index(arena);
     if (arena->index_count == 0) return;  // OOM or empty
 
@@ -434,10 +621,8 @@ void actor_gc_collect_full(actor_gc_arena_t *arena, actor_gc_root_t *roots, int 
         obj = obj->next;
     }
 
-    // Phase 2: Mark from roots (follows Boehm pointers one level deep)
-    for (int i = 0; i < num_roots; i++) {
-        scan_roots_mark(arena, roots[i].start, roots[i].size);
-    }
+    // Phase 2: Mark from roots via BFS through Boehm heap
+    mark_from_roots_bfs(arena, roots, num_roots);
 
     // Phase 3: Sweep — free objects that are unmarked AND have no external refs
     actor_gc_obj_t **prev = &arena->objects;
@@ -454,14 +639,21 @@ void actor_gc_collect_full(actor_gc_arena_t *arena, actor_gc_root_t *roots, int 
             extref_count++;
             prev = &obj->next;
         } else {
-            // Dead: unreachable locally, no foreign references
+            // Dead: unreachable locally, no foreign references.
+            // Remove from objects list and add to free list for reuse.
             *prev = next;
             freed += obj->size;
             freed_count++;
-            // TODO: free list reuse causes corruption (likely alignment
-            // mismatch between header size and bump-allocated layout).
-            // Swept blocks are leaked for now. With 8GB virtual region
-            // and overcommit, physical pages are reclaimed by the OS.
+            arena->free_bytes += obj->size;
+
+            // Write sentinel to payload for corruption detection on reuse
+            if (obj->size >= sizeof(uint64_t)) {
+                *(uint64_t *)actor_gc_payload(obj) = AGC_FREELIST_SENTINEL;
+            }
+
+            // Prepend to free list (LIFO — matches LIFO alloc for cache warmth)
+            obj->next = arena->free_list;
+            arena->free_list = obj;
         }
         obj = next;
     }
