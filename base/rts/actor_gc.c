@@ -318,28 +318,10 @@ void *actor_gc_alloc(actor_gc_arena_t *arena, size_t size) {
     size_t aligned_size = ALIGN_UP(size, ARENA_ALIGN);
     size_t total = sizeof(actor_gc_obj_t) + aligned_size;
 
-    // 1. Try free list (head-only, LIFO): reuse if head block is large enough.
-    actor_gc_obj_t *blk = arena->free_list;
-    if (blk && blk->size >= aligned_size) {
-        arena->free_list = blk->next;
-        arena->free_bytes -= blk->size;
+    // Free list reuse disabled — causes intermittent corruption (race condition
+    // between ENQ_msg and GC sweep). Limbo cycle not sufficient.
 
-        uint32_t reuse_size = blk->size;
-        blk->owner = arena;
-        blk->flags = 0;
-        blk->ext_refcount = 0;
-
-        blk->next = arena->objects;
-        arena->objects = blk;
-        arena->total_bytes += reuse_size;
-        arena->num_objects++;
-
-        void *payload = actor_gc_payload(blk);
-        memset(payload, 0, reuse_size);
-        return payload;
-    }
-
-    // 2. Bump allocate from global region
+    // Bump allocate from global region
     void *block = region_bump_alloc(total);
     if (!block) return NULL;
 
