@@ -330,6 +330,10 @@ void *actor_gc_alloc(actor_gc_arena_t *arena, size_t size) {
 
         void *payload = actor_gc_payload(blk);
         memset(payload, 0, reuse_size);
+        if ((char *)payload < region_base + 0x4000000) {
+            fprintf(stderr, "AGC ALLOC-REUSE: arena=%p payload=%p size=%u caller=%p\n",
+                    (void *)arena, payload, reuse_size, __builtin_return_address(0));
+        }
         return payload;
     }
 
@@ -350,7 +354,12 @@ void *actor_gc_alloc(actor_gc_arena_t *arena, size_t size) {
     arena->total_bytes += aligned_size;
     arena->num_objects++;
 
-    return actor_gc_payload(obj);
+    void *payload = actor_gc_payload(obj);
+    if ((char *)payload < region_base + 0x4000000) {
+        fprintf(stderr, "AGC ALLOC-BUMP: arena=%p payload=%p size=%u caller=%p\n",
+                (void *)arena, payload, (uint32_t)aligned_size, __builtin_return_address(0));
+    }
+    return payload;
 }
 
 size_t actor_gc_obj_size(void *ptr) {
@@ -736,6 +745,13 @@ void actor_gc_collect_full(actor_gc_arena_t *arena, actor_gc_root_t *roots, int 
             arena->free_bytes += obj->size;
 
             // Write sentinel for corruption detection
+            {
+                void *swept_payload = actor_gc_payload(obj);
+                if ((char *)swept_payload < region_base + 0x4000000) {
+                    fprintf(stderr, "AGC SWEEP: arena=%p payload=%p size=%u\n",
+                            (void *)arena, swept_payload, obj->size);
+                }
+            }
             if (obj->size >= sizeof(uint64_t)) {
                 *(uint64_t *)actor_gc_payload(obj) = AGC_FREELIST_SENTINEL;
             }
