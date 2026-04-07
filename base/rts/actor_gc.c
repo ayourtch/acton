@@ -18,7 +18,7 @@ static volatile char *bump_ptr = NULL;
 
 #define DEFAULT_REGION_SIZE (8UL * 1024 * 1024 * 1024)
 
-#define INITIAL_THRESHOLD (256 * 1024)
+#define INITIAL_THRESHOLD (1024 * 1024)
 #define THRESHOLD_GROWTH 2
 #define MIN_RECLAIM_RATIO 0.25
 
@@ -492,8 +492,8 @@ void actor_gc_collect_full(actor_gc_arena_t *arena, actor_gc_root_t *roots, int 
         obj = next;
     }
 
-    arena->total_bytes -= freed;
-    arena->num_objects -= freed_count;
+    arena->total_bytes = (freed <= arena->total_bytes) ? arena->total_bytes - freed : 0;
+    arena->num_objects = (freed_count <= arena->num_objects) ? arena->num_objects - freed_count : 0;
     arena->bytes_freed += freed;
 
     // Adjust threshold
@@ -506,8 +506,9 @@ void actor_gc_collect_full(actor_gc_arena_t *arena, actor_gc_root_t *roots, int 
     }
 
     // Uncomment for debug:
-    // fprintf(stderr, "AGC collect #%zu: marked %zu, swept %zu, live %zu\n",
-    //         arena->collections, marked_count, freed_count, arena->num_objects);
+    // fprintf(stderr, "AGC[%p] #%zu: %zu marked, %zu swept, %zu live (%zu B)\n",
+    //         (void *)arena, arena->collections, marked_count, freed_count,
+    //         arena->num_objects, arena->total_bytes);
 }
 
 // --- Cross-actor reference tracking ---
