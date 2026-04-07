@@ -68,6 +68,11 @@ struct actor_gc_arena {
     actor_gc_index_entry_t *index;  // sorted by payload_start
     size_t index_count;             // number of entries
     size_t index_cap;               // allocated capacity
+    // Boehm pin set: GC_malloc'd array of Boehm pointers discovered during BFS.
+    // Keeps Boehm objects alive without registering the entire arena as roots.
+    void **boehm_pin_set;           // GC_malloc'd array (Boehm sees it as root)
+    size_t pin_set_count;           // number of pinned Boehm pointers
+    size_t pin_set_cap;             // allocated capacity
     // Foreign reference tracking
     void **foreign_refs;            // array of foreign arena ptrs this actor references
     int foreign_refs_count;         // current count

@@ -25,11 +25,10 @@ static volatile char *bump_ptr = NULL;
 #define ARENA_ALIGN 16
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
 
-// Boehm root scanning
+// Boehm root scanning (legacy — replaced by per-arena pin sets)
 #define ROOT_CHUNK_SIZE (1024 * 1024)
 static volatile char *roots_registered_up_to = NULL;
-// Default: root scanning ON (all-in arena needs it for Boehm pointer safety)
-static int actor_gc_no_roots = 0;
+static int actor_gc_no_roots = 1;  // pin sets replace root scanning
 
 // --- Diagnostic: sweep ring buffer ---
 // Records the last N payload addresses written with sentinel (filled with 0xDEADB00F...)
@@ -190,7 +189,7 @@ int actor_gc_global_init(size_t size) {
 
     fprintf(stderr, "ACTOR_GC: region %p - %p (%zu MB)%s\n",
             region_base, region_end, size / (1024*1024),
-            actor_gc_no_roots ? " [no root scanning]" : " [root scanning ON]");
+            actor_gc_no_roots ? " [pin set mode]" : " [root scanning ON]");
     return 0;
 }
 
@@ -214,6 +213,9 @@ void actor_gc_arena_init(actor_gc_arena_t *arena) {
     arena->index = NULL;
     arena->index_count = 0;
     arena->index_cap = 0;
+    arena->boehm_pin_set = NULL;
+    arena->pin_set_count = 0;
+    arena->pin_set_cap = 0;
     arena->foreign_refs = NULL;
     arena->foreign_refs_count = 0;
     arena->foreign_refs_cap = 0;
@@ -232,6 +234,10 @@ void actor_gc_arena_destroy(actor_gc_arena_t *arena) {
     }
     arena->index_count = 0;
     arena->index_cap = 0;
+    // boehm_pin_set is GC_malloc'd — just NULL the pointer, Boehm will collect it
+    arena->boehm_pin_set = NULL;
+    arena->pin_set_count = 0;
+    arena->pin_set_cap = 0;
     if (arena->foreign_refs) {
         free(arena->foreign_refs);
         arena->foreign_refs = NULL;
@@ -241,16 +247,13 @@ void actor_gc_arena_destroy(actor_gc_arena_t *arena) {
 }
 
 // --- Boehm root scanning ---
+// Root scanning is replaced by per-arena pin sets (built during BFS mark phase).
+// The pin set is a GC_malloc'd array of Boehm pointers discovered during marking,
+// so Boehm treats it as containing valid references and keeps those objects alive.
 
 static void ensure_roots_registered(char *up_to) {
-    if (actor_gc_no_roots) return;
-    char *registered = (char *)roots_registered_up_to;
-    if (up_to <= registered) return;
-    char *new_limit = (char *)ALIGN_UP((uintptr_t)up_to, ROOT_CHUNK_SIZE);
-    if (new_limit > region_end) new_limit = region_end;
-    if (__sync_bool_compare_and_swap(&roots_registered_up_to, registered, new_limit)) {
-        GC_add_roots(registered, new_limit);
-    }
+    (void)up_to;
+    // No-op: replaced by per-arena boehm_pin_set built during collection.
 }
 
 // --- Bump allocator ---
@@ -625,6 +628,31 @@ static void mark_from_roots_bfs(actor_gc_arena_t *arena,
         fprintf(stderr, "AGC BUG: boehm_ht overflow %d time(s) during BFS "
                 "(final cap=%d, boehm_unique=%d) — objects may have been missed!\n",
                 boehm_ht_overflow, boehm_ht_cap, boehm_wl_n);
+    }
+
+    // Build pin set: all unique Boehm objects discovered during BFS.
+    // Allocated via GC_malloc so Boehm sees the pointers and keeps the objects alive.
+    if (boehm_wl_n > 0) {
+        size_t need = (size_t)boehm_wl_n;
+        if (need > arena->pin_set_cap) {
+            // Round up to power of 2 for growth
+            size_t cap = arena->pin_set_cap ? arena->pin_set_cap : 64;
+            while (cap < need) cap *= 2;
+            arena->boehm_pin_set = (void **)GC_malloc(cap * sizeof(void *));
+            arena->pin_set_cap = cap;
+        }
+        memcpy(arena->boehm_pin_set, boehm_wl, need * sizeof(void *));
+        arena->pin_set_count = need;
+        // Zero out the rest so Boehm doesn't see stale pointers
+        if (need < arena->pin_set_cap) {
+            memset(arena->boehm_pin_set + need, 0,
+                   (arena->pin_set_cap - need) * sizeof(void *));
+        }
+    } else {
+        // No Boehm objects referenced — clear pin set
+        arena->boehm_pin_set = NULL;
+        arena->pin_set_count = 0;
+        arena->pin_set_cap = 0;
     }
 
 cleanup:
