@@ -18,7 +18,7 @@ static volatile char *bump_ptr = NULL;
 
 #define DEFAULT_REGION_SIZE (8UL * 1024 * 1024 * 1024)
 
-#define INITIAL_THRESHOLD (1024 * 1024)
+#define INITIAL_THRESHOLD (64 * 1024 * 1024)
 #define THRESHOLD_GROWTH 2
 #define MIN_RECLAIM_RATIO 0.25
 
