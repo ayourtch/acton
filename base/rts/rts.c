@@ -1612,20 +1612,6 @@ void wt_work_cb(uv_check_t *ev) {
         volatile B_Msg m = current->B_Msg;
         $Cont cont = m->$cont;
         $WORD val = m->value;
-        // DEBUG: detect swept continuations before they crash
-        if (cont && actor_gc_is_arena_ptr(cont)) {
-            uint64_t first = *(uint64_t *)cont;
-            if (first == 0xDEADB00FDEADBA11ULL) {
-                fprintf(stderr, "AGC BUG: actor=%p cont=%p is SWEPT (sentinel)! m=%p arena=%p\n",
-                        (void*)current, (void*)cont, (void*)m, (void*)actor_gc_get_current());
-                // Print cont header
-                actor_gc_obj_t *hdr = (actor_gc_obj_t *)((char*)cont - sizeof(actor_gc_obj_t));
-                fprintf(stderr, "  hdr: owner=%p size=%u flags=%x ext_refcount=%u\n",
-                        (void*)hdr->owner, hdr->size, hdr->flags, hdr->ext_refcount);
-                actor_gc_print_sweep_ring();
-                abort();
-            }
-        }
 
         uv_clock_gettime(UV_CLOCK_MONOTONIC, &ts1);
         wt_stats[wctx->id].state = WT_Working;
