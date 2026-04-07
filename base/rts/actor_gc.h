@@ -45,6 +45,13 @@ typedef struct actor_gc_obj {
     uint16_t ext_refcount;          // cross-actor reference count (atomic)
 } actor_gc_obj_t;  // 24 bytes
 
+// Sorted index entry for fast pointer lookup during mark phase
+typedef struct {
+    uintptr_t payload_start;        // start of payload region
+    uintptr_t payload_end;          // end of payload region (start + size)
+    actor_gc_obj_t *obj;            // pointer to object header
+} actor_gc_index_entry_t;
+
 // Per-actor arena
 struct actor_gc_arena {
     actor_gc_obj_t *objects;        // linked list of all live objects
@@ -55,6 +62,10 @@ struct actor_gc_arena {
     size_t collect_threshold;       // trigger collection when total_bytes exceeds this
     size_t collections;             // number of collections performed
     size_t bytes_freed;             // total bytes freed across all collections
+    // Sorted index for O(log n) pointer lookup during collection
+    actor_gc_index_entry_t *index;  // sorted by payload_start
+    size_t index_count;             // number of entries
+    size_t index_cap;               // allocated capacity
     // Foreign reference tracking
     void **foreign_refs;            // array of foreign arena ptrs this actor references
     int foreign_refs_count;         // current count

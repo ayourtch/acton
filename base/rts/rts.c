@@ -1775,12 +1775,10 @@ void wt_work_cb(uv_check_t *ev) {
                     }
 
                     // Collect if over threshold
-                    // TODO: O(n^2) scan_range_mark is too slow for large object sets.
-                    // Disable collection for now; enable after adding sorted index.
-                    //if (arena->total_bytes > arena->collect_threshold) {
-                    //    actor_gc_root_t roots[1] = {{actor_base, actor_size - offset}};
-                    //    actor_gc_collect_full(arena, roots, 1);
-                    //}
+                    if (arena->total_bytes > arena->collect_threshold) {
+                        actor_gc_root_t roots[1] = {{actor_base, actor_size - offset}};
+                        actor_gc_collect_full(arena, roots, 1);
+                    }
                 }
             }
         }
