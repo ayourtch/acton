@@ -312,14 +312,28 @@ void *actor_gc_alloc(actor_gc_arena_t *arena, size_t size) {
     size_t aligned_size = ALIGN_UP(size, ARENA_ALIGN);
     size_t total = sizeof(actor_gc_obj_t) + aligned_size;
 
-    // Free list reuse disabled: ext_refcount tracking is incomplete.
-    // Arena pointers can reach other actors through paths not covered by
-    // track_outgoing_refs (e.g. $RWAIT wakeup writing x->value to m->value).
-    // Without complete tracking, swept objects get accessed via stale pointers.
-    // TODO: implement deferred free list (limbo for one GC cycle) to allow
-    // stale refs to be detected before reuse.
+    // 1. Try free list (head-only, LIFO): reuse if head block is large enough.
+    actor_gc_obj_t *blk = arena->free_list;
+    if (blk && blk->size >= aligned_size) {
+        arena->free_list = blk->next;
+        arena->free_bytes -= blk->size;
 
-    // Bump allocate from global region
+        uint32_t reuse_size = blk->size;
+        blk->owner = arena;
+        blk->flags = 0;
+        blk->ext_refcount = 0;
+
+        blk->next = arena->objects;
+        arena->objects = blk;
+        arena->total_bytes += reuse_size;
+        arena->num_objects++;
+
+        void *payload = actor_gc_payload(blk);
+        memset(payload, 0, reuse_size);
+        return payload;
+    }
+
+    // 2. Bump allocate from global region
     void *block = region_bump_alloc(total);
     if (!block) return NULL;
 
@@ -680,7 +694,7 @@ void actor_gc_collect_full(actor_gc_arena_t *arena, actor_gc_root_t *roots, int 
         if (obj->flags & AGC_FLAG_MARK) {
             marked_count++;
             prev = &obj->next;
-        } else if (obj->ext_refcount > 0) {
+        } else if (__sync_fetch_and_add(&obj->ext_refcount, 0) > 0) {
             extref_count++;
             prev = &obj->next;
         } else {
@@ -715,11 +729,19 @@ void actor_gc_collect_full(actor_gc_arena_t *arena, actor_gc_root_t *roots, int 
                 }
             }
 
-            // Remove from objects list (leak into arena region).
-            // Free list reuse is disabled; swept blocks are not reclaimed.
+            // Remove from objects list and add to free list for reuse.
             *prev = next;
             freed += obj->size;
             freed_count++;
+            arena->free_bytes += obj->size;
+
+            // Write sentinel for corruption detection
+            if (obj->size >= sizeof(uint64_t)) {
+                *(uint64_t *)actor_gc_payload(obj) = AGC_FREELIST_SENTINEL;
+            }
+
+            obj->next = arena->free_list;
+            arena->free_list = obj;
         }
         obj = next;
     }

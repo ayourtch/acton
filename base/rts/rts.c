@@ -1612,6 +1612,14 @@ void wt_work_cb(uv_check_t *ev) {
         volatile B_Msg m = current->B_Msg;
         $Cont cont = m->$cont;
         $WORD val = m->value;
+        // Safety: detect use-after-free from swept arena objects
+        if (cont && actor_gc_is_arena_ptr(cont) &&
+            *(uint64_t *)cont == 0xDEADB00FDEADBA11ULL) {
+            actor_gc_obj_t *hdr = actor_gc_header(cont);
+            fprintf(stderr, "AGC BUG: actor=%p cont=%p SWEPT! owner=%p ext_refcount=%u\n",
+                    (void*)current, (void*)cont, (void*)hdr->owner, hdr->ext_refcount);
+            abort();
+        }
         uv_clock_gettime(UV_CLOCK_MONOTONIC, &ts1);
         wt_stats[wctx->id].state = WT_Working;
 
