@@ -234,34 +234,8 @@ void *actor_gc_alloc(actor_gc_arena_t *arena, size_t size) {
     size_t aligned_size = ALIGN_UP(size, ARENA_ALIGN);
     size_t total = sizeof(actor_gc_obj_t) + aligned_size;
 
-    // 1. Check free list (first-fit)
-    actor_gc_obj_t **prev = &arena->free_list;
-    actor_gc_obj_t *blk = arena->free_list;
-    while (blk) {
-        size_t blk_aligned = ALIGN_UP(blk->size, ARENA_ALIGN);
-        if (blk_aligned >= aligned_size) {
-            // Found a fit — remove from free list
-            *prev = blk->next;
-            arena->free_bytes -= blk->size;
-
-            // Zero the payload
-            memset(actor_gc_payload(blk), 0, blk->size);
-
-            // Set up header (keep original size for the block)
-            blk->next = arena->objects;
-            arena->objects = blk;
-            blk->owner = arena;
-            blk->flags = 0;
-            blk->ext_refcount = 0;
-            // Keep blk->size as the original block size (may be >= requested)
-
-            arena->total_bytes += blk->size;
-            arena->num_objects++;
-            return actor_gc_payload(blk);
-        }
-        prev = &blk->next;
-        blk = blk->next;
-    }
+    // Free list reuse disabled — see TODO in sweep phase.
+    // All allocations come from the bump pointer.
 
     // 2. Bump allocate from global region
     void *block = region_bump_alloc(total);
@@ -484,10 +458,10 @@ void actor_gc_collect_full(actor_gc_arena_t *arena, actor_gc_root_t *roots, int 
             *prev = next;
             freed += obj->size;
             freed_count++;
-            // TODO: free list reuse causes corruption — investigate header/size
-            // mismatch on reuse. For now, swept objects are leaked (not reused).
-            // With 8GB virtual region and overcommit, this is acceptable for
-            // benchmarking. Physical pages are reclaimed by the OS when unused.
+            // TODO: free list reuse causes corruption (likely alignment
+            // mismatch between header size and bump-allocated layout).
+            // Swept blocks are leaked for now. With 8GB virtual region
+            // and overcommit, physical pages are reclaimed by the OS.
         }
         obj = next;
     }
