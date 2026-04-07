@@ -203,9 +203,11 @@ bool actor_gc_is_arena_ptr(void *ptr) {
 void actor_gc_arena_init(actor_gc_arena_t *arena) {
     arena->objects = NULL;
     arena->free_list = NULL;
+    arena->limbo = NULL;
     arena->total_bytes = 0;
     arena->num_objects = 0;
     arena->free_bytes = 0;
+    arena->limbo_bytes = 0;
     arena->collect_threshold = INITIAL_THRESHOLD;
     arena->collections = 0;
     arena->bytes_freed = 0;
@@ -220,6 +222,7 @@ void actor_gc_arena_init(actor_gc_arena_t *arena) {
 void actor_gc_arena_destroy(actor_gc_arena_t *arena) {
     arena->objects = NULL;
     arena->free_list = NULL;
+    arena->limbo = NULL;
     arena->total_bytes = 0;
     arena->num_objects = 0;
     arena->free_bytes = 0;
@@ -330,10 +333,6 @@ void *actor_gc_alloc(actor_gc_arena_t *arena, size_t size) {
 
         void *payload = actor_gc_payload(blk);
         memset(payload, 0, reuse_size);
-        if ((char *)payload < region_base + 0x4000000) {
-            fprintf(stderr, "AGC ALLOC-REUSE: arena=%p payload=%p size=%u caller=%p\n",
-                    (void *)arena, payload, reuse_size, __builtin_return_address(0));
-        }
         return payload;
     }
 
@@ -355,10 +354,6 @@ void *actor_gc_alloc(actor_gc_arena_t *arena, size_t size) {
     arena->num_objects++;
 
     void *payload = actor_gc_payload(obj);
-    if ((char *)payload < region_base + 0x4000000) {
-        fprintf(stderr, "AGC ALLOC-BUMP: arena=%p payload=%p size=%u caller=%p\n",
-                (void *)arena, payload, (uint32_t)aligned_size, __builtin_return_address(0));
-    }
     return payload;
 }
 
@@ -667,7 +662,28 @@ void actor_gc_collect_full(actor_gc_arena_t *arena, actor_gc_root_t *roots, int 
 
     arena->collections++;
 
-    // Phase 0: Count actual objects (num_objects can drift if underflow guard fires)
+    // Phase 0a: Promote limbo → free_list.
+    // Objects in limbo were swept in the PREVIOUS collection cycle.
+    // One full cycle has elapsed, so any concurrent ENQ_msg + track_outgoing_refs
+    // that referenced these objects has completed by now.
+    {
+        actor_gc_obj_t *limbo_obj = arena->limbo;
+        while (limbo_obj) {
+            actor_gc_obj_t *next = limbo_obj->next;
+            // Write sentinel now that the object is truly safe to reuse
+            if (limbo_obj->size >= sizeof(uint64_t)) {
+                *(uint64_t *)actor_gc_payload(limbo_obj) = AGC_FREELIST_SENTINEL;
+            }
+            limbo_obj->next = arena->free_list;
+            arena->free_list = limbo_obj;
+            arena->free_bytes += limbo_obj->size;
+            limbo_obj = next;
+        }
+        arena->limbo = NULL;
+        arena->limbo_bytes = 0;
+    }
+
+    // Phase 0b: Count actual objects (num_objects can drift if underflow guard fires)
     // and build sorted index for O(log n) pointer lookup.
     {
         size_t actual_count = 0;
@@ -738,26 +754,17 @@ void actor_gc_collect_full(actor_gc_arena_t *arena, actor_gc_root_t *roots, int 
                 }
             }
 
-            // Remove from objects list and add to free list for reuse.
+            // Remove from objects list and add to limbo (deferred free).
+            // Objects go to limbo first, then get promoted to free_list
+            // on the NEXT collection cycle. This ensures any concurrent
+            // ENQ_msg + track_outgoing_refs has time to complete.
             *prev = next;
             freed += obj->size;
             freed_count++;
-            arena->free_bytes += obj->size;
+            arena->limbo_bytes += obj->size;
 
-            // Write sentinel for corruption detection
-            {
-                void *swept_payload = actor_gc_payload(obj);
-                if ((char *)swept_payload < region_base + 0x4000000) {
-                    fprintf(stderr, "AGC SWEEP: arena=%p payload=%p size=%u\n",
-                            (void *)arena, swept_payload, obj->size);
-                }
-            }
-            if (obj->size >= sizeof(uint64_t)) {
-                *(uint64_t *)actor_gc_payload(obj) = AGC_FREELIST_SENTINEL;
-            }
-
-            obj->next = arena->free_list;
-            arena->free_list = obj;
+            obj->next = arena->limbo;
+            arena->limbo = obj;
         }
         obj = next;
     }

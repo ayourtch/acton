@@ -56,9 +56,11 @@ typedef struct {
 struct actor_gc_arena {
     actor_gc_obj_t *objects;        // linked list of all live objects
     actor_gc_obj_t *free_list;      // freed blocks available for reuse
+    actor_gc_obj_t *limbo;          // swept last cycle, promoted to free_list next cycle
     size_t total_bytes;             // total live bytes allocated (payload only)
     size_t num_objects;             // number of live objects
     size_t free_bytes;              // bytes available in free list
+    size_t limbo_bytes;             // bytes in limbo (deferred free)
     size_t collect_threshold;       // trigger collection when total_bytes exceeds this
     size_t collections;             // number of collections performed
     size_t bytes_freed;             // total bytes freed across all collections
