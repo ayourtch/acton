@@ -434,8 +434,9 @@ declDeserialize env n c props sup_c = (gen env (tCon c) <+> genTopName env (meth
                                               create) $+$
                                       char '}'
         create                      = gen env self <+> text "=" <+> gen env primDNEW <> parens (genTopName env n <> comma <+> gen env st) <> semi
-        alloc                       = gen env self <+> equals <+> acton_malloc env (gname env n) <> semi $+$
+        alloc                       = gen env self <+> equals <+> malloc env (gname env n) <> semi $+$
                                       gen env self <> text "->" <> gen env1 classKW <+> equals <+> char '&' <> methodtable env1 n <> semi
+        malloc                      = if isLeafName n then acton_malloc_leaf else acton_malloc
         super_step | [c] <- sup_c   = deserializeSup env (tcname c) <> parens (parens (gen env $ tcname c) <> gen env self <> comma <+> gen env st) <> semi
                    | otherwise      = empty
         super_attrs                 = [ i | c <- sup_c, i <- conAttrs env (tcname c) ]
@@ -826,7 +827,7 @@ genNew env n p                      = newcon' env n <> parens (gen env p)
 
 declCon env n q b
   | null abstr || hasNotImpl b      = (gen env tRes <+> newcon env n <> parens (gen env pars) <+> char '{') $+$
-                                      nest 4 (gen env tObj <+> gen env tmpV <+> equals <+> acton_malloc env (gname env n) <> semi $+$
+                                      nest 4 (gen env tObj <+> gen env tmpV <+> equals <+> malloc env (gname env n) <> semi $+$
                                               gen env tmpV <> text "->" <> gen env1 classKW <+> equals <+> char '&' <> methodtable env1 n <> semi $+$
                                               altcall $+$
                                               initcall) $+$
@@ -851,8 +852,18 @@ declCon env n q b
         retobj (PosArg e p)         = PosArg (eCall (tApp (eQVar primCONSTCONT) [tObj]) [eVar tmpV, e]) p
         env1                        = ldefine ((tmpV, NVar tObj) : envOf pars) env
         abstr                       = abstractAttrs env (NoQ n)
+        malloc                      = if isLeafName n then acton_malloc_leaf else acton_malloc
 
 acton_malloc env n                  = text "acton_malloc" <> parens (text "sizeof" <> parens (text "struct" <+> gen env n))
+
+acton_malloc_leaf env n             = text "acton_malloc_leaf" <> parens (text "sizeof" <> parens (text "struct" <+> gen env n))
+
+-- Leaf type names: types with no outgoing GC pointers (only static vtable + scalar data).
+-- These can be allocated in per-actor arenas without Boehm root scanning.
+leafTypeNames                       = [nInt, nFloat, nBigint, nBool, nI32, nI16, nU64, nU32, nU16]
+
+isLeafName                          :: Name -> Bool
+isLeafName n                        = n `elem` leafTypeNames
 
 comma' x                            = if isEmpty x then empty else comma <+> x
 
