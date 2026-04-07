@@ -243,7 +243,7 @@ static void *region_bump_alloc(size_t total_size) {
 #define AGC_FREELIST_SENTINEL 0xDEADB00FDEADBA11ULL
 
 
-void *actor_gc_alloc(actor_gc_arena_t *arena, size_t size) {
+static inline void *arena_alloc_internal(actor_gc_arena_t *arena, size_t size, uint16_t flags) {
     if (!region_base) return NULL;
 
     size_t aligned_size = ALIGN_UP(size, ARENA_ALIGN);
@@ -261,7 +261,7 @@ void *actor_gc_alloc(actor_gc_arena_t *arena, size_t size) {
     actor_gc_obj_t *obj = (actor_gc_obj_t *)block;
     obj->size = (uint32_t)aligned_size;
     obj->owner = arena;
-    obj->flags = 0;
+    obj->flags = flags;
     obj->ext_refcount = 0;
 
     obj->next = arena->objects;
@@ -269,8 +269,16 @@ void *actor_gc_alloc(actor_gc_arena_t *arena, size_t size) {
     arena->total_bytes += aligned_size;
     arena->num_objects++;
 
-    void *payload = actor_gc_payload(obj);
-    return payload;
+    return actor_gc_payload(obj);
+}
+
+void *actor_gc_alloc(actor_gc_arena_t *arena, size_t size) {
+    return arena_alloc_internal(arena, size, 0);
+}
+
+// Allocate a leaf object (no outgoing GC pointers — skip scanning in mark phase).
+void *actor_gc_alloc_leaf(actor_gc_arena_t *arena, size_t size) {
+    return arena_alloc_internal(arena, size, AGC_FLAG_LEAF);
 }
 
 size_t actor_gc_obj_size(void *ptr) {

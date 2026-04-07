@@ -119,16 +119,25 @@ void* acton_malloc(size_t size) {
     return acton__allocator.calloc(1, size);
 }
 
+// Declared in actor_gc.c (not in .h to avoid header changes)
+void *actor_gc_alloc_leaf(actor_gc_arena_t *arena, size_t size);
+
 void* acton_malloc_atomic(size_t size) {
+    // Route atomic (leaf) allocations to arena — reduces Boehm GC pressure.
+    actor_gc_arena_t *arena = actor_gc_get_current();
+    if (arena) {
+        void *p = actor_gc_alloc_leaf(arena, size);
+        if (p) return p;
+        // Fall through to Boehm if arena region exhausted
+    }
     return acton__allocator.malloc_atomic(size);
 }
 
 // Arena-aware allocation for leaf objects (no outgoing GC pointers).
-// Same as acton_malloc but could set AGC_FLAG_LEAF in the future.
 void* acton_malloc_leaf(size_t size) {
     actor_gc_arena_t *arena = actor_gc_get_current();
     if (arena) {
-        void *p = actor_gc_alloc(arena, size);
+        void *p = actor_gc_alloc_leaf(arena, size);
         if (p) return p;
     }
     return acton__allocator.calloc(1, size);
