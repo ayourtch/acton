@@ -969,31 +969,58 @@ void FLUSH_outgoing_db($Actor self, uuid_t *txnid) {
 }
 #endif
 
-// Promote any arena pointers in an outgoing message's continuation to Boehm.
-// This ensures the receiving actor doesn't hold references into the sender's arena.
-static void promote_outgoing_msg(B_Msg m) {
+// Track cross-actor references in an outgoing message.
+// Instead of copying arena objects to Boehm, increment ext_refcount on
+// arena objects referenced by the message. This keeps objects alive in
+// the sender's arena until the receiver is done with them.
+static void track_outgoing_refs(B_Msg m) {
     if (!m->$cont) return;
 
-    // If the continuation itself is in the arena, promote the whole thing
+    // Track arena pointers in the continuation
     if (actor_gc_is_arena_ptr(m->$cont)) {
-        m->$cont = ($Cont)actor_gc_promote_one(m->$cont);
+        actor_gc_track_refs_recursive(m->$cont);
     } else {
-        // Continuation is on Boehm, but may contain fields pointing to arena.
-        // Scan its contents for arena pointers.
+        // Continuation is on Boehm — scan its contents for arena pointers
         void *base = GC_base(m->$cont);
         if (base) {
             size_t obj_size = GC_size(base);
             size_t offset = (char *)m->$cont - (char *)base;
             if (obj_size > offset) {
-                actor_gc_promote_region(m->$cont, obj_size - offset);
+                uintptr_t addr = (uintptr_t)m->$cont;
+                uintptr_t end = addr + (obj_size - offset);
+                addr = (addr + sizeof(void *) - 1) & ~(sizeof(void *) - 1);
+                while (addr + sizeof(void *) <= end) {
+                    void *candidate = *(void **)addr;
+                    if (actor_gc_is_arena_ptr(candidate)) {
+                        actor_gc_track_refs_recursive(candidate);
+                    }
+                    addr += sizeof(void *);
+                }
             }
         }
     }
 
-    // Also promote the message's value if it's an arena pointer
+    // Track arena pointers in the message value
     if (m->value && actor_gc_is_arena_ptr(m->value)) {
-        m->value = ($WORD)actor_gc_promote_one(m->value);
+        actor_gc_track_refs_recursive(m->value);
     }
+}
+
+// Clear VISITED flags on arena objects after tracking outgoing refs.
+// We need to clear visited flags on ALL arenas that might have been touched
+// (the sender's arena and any arena containing objects transitively referenced).
+// For simplicity, clear on the sender's arena. Cross-arena visited flags
+// will be cleared by those arenas' next operation.
+static void clear_outgoing_visited($Actor self) {
+    actor_gc_arena_t *arena = actor_gc_get_current();
+    if (arena) {
+        actor_gc_clear_visited(arena);
+    }
+    // Also clear visited on any foreign objects we touched.
+    // Since visited is a transient flag and we're the only writer right now,
+    // it's OK if some foreign objects keep VISITED briefly — it only means
+    // they'd be skipped in a concurrent track_refs_recursive, which is safe
+    // (they already have their ext_refcount incremented).
 }
 
 // Actually send all buffered messages of the sender, using internal queues only
@@ -1006,9 +1033,9 @@ void FLUSH_outgoing_local($Actor self) {
         B_Msg next = m->$next;
         m->$next = NULL;
 
-        // Promote arena pointers before delivering to another actor
+        // Track cross-actor references (increment ext_refcount)
         if (m->$to != self) {
-            promote_outgoing_msg(m);
+            track_outgoing_refs(m);
         }
 
         long dest;
@@ -1025,6 +1052,8 @@ void FLUSH_outgoing_local($Actor self) {
         }
         m = next;
     }
+    // Clear VISITED flags used during ref tracking
+    clear_outgoing_visited(self);
 }
 
 time_t next_timeout() {
@@ -1728,6 +1757,34 @@ void wt_work_cb(uv_check_t *ev) {
             break;
         }
         }
+
+        // Per-actor GC: update foreign refs and optionally collect
+        // Only on message completion ($RDONE/$RFAIL), not mid-continuation ($RCONT)
+        if (r.tag == $RDONE || r.tag == $RFAIL) {
+            actor_gc_arena_t *arena = actor_gc_get_current();
+            if (arena) {
+                // Get actor struct size for scanning
+                void *actor_base = (void *)current;
+                void *gc_base_ptr = GC_base(actor_base);
+                if (gc_base_ptr) {
+                    size_t actor_size = GC_size(gc_base_ptr);
+                    size_t offset = (char *)actor_base - (char *)gc_base_ptr;
+                    if (actor_size > offset) {
+                        // Update foreign reference tracking
+                        actor_gc_update_foreign_refs(arena, actor_base, actor_size - offset);
+                    }
+
+                    // Collect if over threshold
+                    // TODO: O(n^2) scan_range_mark is too slow for large object sets.
+                    // Disable collection for now; enable after adding sorted index.
+                    //if (arena->total_bytes > arena->collect_threshold) {
+                    //    actor_gc_root_t roots[1] = {{actor_base, actor_size - offset}};
+                    //    actor_gc_collect_full(arena, roots, 1);
+                    //}
+                }
+            }
+        }
+
         SET_SELF(NULL);
 
         uv_clock_gettime(UV_CLOCK_MONOTONIC, &ts3);

@@ -1,17 +1,24 @@
-// Per-actor arena garbage collector
+// Per-actor garbage collector with ownership tracking
 //
 // Memory architecture:
-// - One large virtual memory region is reserved at startup (e.g. 1GB)
-// - Physical pages are only allocated on demand (mmap overcommit)
-// - Any pointer within [region_base, region_base+region_size) is arena-owned
-// - This gives O(1) pointer ownership checks
-// - Each actor gets a sub-arena within this region via bump allocation
-// - If the region is exhausted, allocations fall back to Boehm GC
+// - One large virtual memory region reserved at startup (1GB, overcommit)
+// - Physical pages allocated on demand
+// - Any pointer in [region_base, region_end) is arena-owned: O(1) check
+// - Each actor gets a per-actor arena within this region
+// - Allocation: free list first, then bump from region, then Boehm fallback
+//
+// Ownership model:
+// - Every arena object has an owner (the arena that allocated it)
+// - Objects stay in the owner's arena for their lifetime (no copying)
+// - Cross-actor references tracked via ext_refcount on the object header
+// - On message send: increment ext_refcount on referenced arena objects
+// - On message done: decrement ext_refcount for dropped foreign references
+// - Collection: sweep only objects with mark=0 AND ext_refcount=0
 //
 // Integration:
-// - Arenas are stored in a hash table keyed by actor pointer (NOT in $Actor struct)
-// - A thread-local caches the current actor's arena for fast access
-// - acton_malloc/acton_realloc route to the arena when an actor is executing
+// - Arenas stored in hash table keyed by actor pointer (NOT in $Actor struct)
+// - Thread-local caches current arena for fast access
+// - acton_malloc routes to arena when an actor is executing
 
 #pragma once
 
@@ -19,91 +26,122 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-// Object header prepended to every arena allocation.
-// Keeps it simple: linked list per actor for mark-sweep.
-typedef struct actor_gc_obj {
-    struct actor_gc_obj *next;  // linked list of all objects in this actor's arena
-    uint32_t size;              // usable size (excluding header)
-    uint32_t marked;            // mark bit for GC
-} actor_gc_obj_t;
+// --- Object header ---
 
-// Per-actor arena: a bump pointer into the global region + object list for GC
-typedef struct actor_gc_arena {
-    actor_gc_obj_t *objects;    // linked list of all allocated objects
-    size_t total_bytes;         // total bytes allocated
-    size_t num_objects;         // number of live objects
-    size_t collect_threshold;   // trigger collection when total_bytes exceeds this
-    size_t collections;         // number of collections performed
-    size_t bytes_freed;         // total bytes freed across all collections
-} actor_gc_arena_t;
+// Flags for actor_gc_obj_t.flags
+#define AGC_FLAG_MARK      0x0001   // Reachable from local roots
+#define AGC_FLAG_LEAF      0x0002   // No outgoing pointers (skip scanning)
+#define AGC_FLAG_VISITED   0x0004   // Temporary: used during ref tracking traversal
+
+// Forward declaration
+typedef struct actor_gc_arena actor_gc_arena_t;
+
+// Object header prepended to every arena allocation.
+typedef struct actor_gc_obj {
+    struct actor_gc_obj *next;      // linked list in owner's arena (objects or free_list)
+    actor_gc_arena_t *owner;        // which arena owns this object
+    uint32_t size;                  // usable payload size (excluding header)
+    uint16_t flags;                 // AGC_FLAG_* bits
+    uint16_t ext_refcount;          // cross-actor reference count (atomic)
+} actor_gc_obj_t;  // 24 bytes
+
+// Per-actor arena
+struct actor_gc_arena {
+    actor_gc_obj_t *objects;        // linked list of all live objects
+    actor_gc_obj_t *free_list;      // freed blocks available for reuse
+    size_t total_bytes;             // total live bytes allocated (payload only)
+    size_t num_objects;             // number of live objects
+    size_t free_bytes;              // bytes available in free list
+    size_t collect_threshold;       // trigger collection when total_bytes exceeds this
+    size_t collections;             // number of collections performed
+    size_t bytes_freed;             // total bytes freed across all collections
+    // Foreign reference tracking
+    void **foreign_refs;            // array of foreign arena ptrs this actor references
+    int foreign_refs_count;         // current count
+    int foreign_refs_cap;           // capacity
+};
+
+// --- Global region management ---
 
 // Initialize the global arena region. Call once at startup.
-// Returns 0 on success, -1 on failure.
 int actor_gc_global_init(size_t region_size);
 
 // O(1) check: is this pointer within the arena region?
 bool actor_gc_is_arena_ptr(void *ptr);
 
-// Initialize a per-actor arena
-void actor_gc_arena_init(actor_gc_arena_t *arena);
+// --- Per-actor arena lifecycle ---
 
-// Allocate memory from the global region, tracked by the given actor arena.
-// Returns zeroed memory. Falls back to NULL if region is exhausted.
+void actor_gc_arena_init(actor_gc_arena_t *arena);
+void actor_gc_arena_destroy(actor_gc_arena_t *arena);
+
+// --- Allocation ---
+
+// Allocate from arena: checks free list, then bump, returns zeroed memory.
+// Returns NULL if region exhausted (caller should fall back to Boehm).
 void *actor_gc_alloc(actor_gc_arena_t *arena, size_t size);
 
-// Realloc within arena: allocate new, copy old data, leave old for sweep.
-// old_ptr must be an arena pointer.
+// Realloc within arena: allocate new, copy, old block goes to free list on next sweep.
 void *actor_gc_realloc(actor_gc_arena_t *arena, void *old_ptr, size_t new_size);
 
-// Get the size of an arena-allocated object (from its header)
+// Get the size of an arena-allocated object
 size_t actor_gc_obj_size(void *ptr);
 
-// Run conservative mark-sweep collection on an arena.
+// --- Collection ---
+
 typedef struct {
     void *start;
     size_t size;
 } actor_gc_root_t;
 
-void actor_gc_collect(actor_gc_arena_t *arena, actor_gc_root_t *roots, int num_roots);
+// Full collection: mark from roots, sweep unmarked objects with ext_refcount==0.
+// Swept objects are moved to the free list for reuse.
+void actor_gc_collect_full(actor_gc_arena_t *arena, actor_gc_root_t *roots, int num_roots);
 
-// Free all memory in an arena (used when actor is destroyed)
-void actor_gc_arena_destroy(actor_gc_arena_t *arena);
+// --- Cross-actor reference tracking ---
 
-// --- Actor-to-arena mapping (hash table, separate from $Actor struct) ---
+// Increment ext_refcount (thread-safe, atomic)
+void actor_gc_ext_ref(void *arena_ptr);
 
-// Register an arena for an actor. The arena is heap-allocated by this function.
-// Returns the new arena, or NULL on failure.
+// Decrement ext_refcount (thread-safe, atomic)
+void actor_gc_ext_unref(void *arena_ptr);
+
+// Recursively increment ext_refcount on arena_ptr and all arena objects
+// reachable from it. Uses AGC_FLAG_VISITED to avoid cycles.
+// Call actor_gc_clear_visited() after a batch of these calls.
+void actor_gc_track_refs_recursive(void *arena_ptr);
+
+// Clear AGC_FLAG_VISITED on all objects visited during track_refs_recursive.
+// Pass the arena that owns the objects, or NULL to clear based on a visited list.
+void actor_gc_clear_visited(actor_gc_arena_t *arena);
+
+// --- Foreign reference management ---
+
+// After an actor finishes processing a message, scan the actor struct for
+// foreign arena pointers and update ext_refcounts accordingly.
+// old_refs/old_count: previous foreign refs (from last call). Pass NULL/0 on first call.
+// actor_start/actor_size: memory region of the actor struct to scan.
+// Updates arena->foreign_refs with the new set.
+void actor_gc_update_foreign_refs(actor_gc_arena_t *arena,
+                                   void *actor_start, size_t actor_size);
+
+// --- Actor-to-arena mapping ---
+
 actor_gc_arena_t *actor_gc_register(void *actor_ptr);
-
-// Look up the arena for an actor. Returns NULL if not registered.
 actor_gc_arena_t *actor_gc_lookup(void *actor_ptr);
-
-// Unregister and destroy an actor's arena.
 void actor_gc_unregister(void *actor_ptr);
 
-// --- Thread-local current arena (set/cleared alongside SET_SELF) ---
+// --- Thread-local current arena ---
 
-// Set the current thread's active arena (call when SET_SELF is called).
-// Pass NULL to clear (when SET_SELF(NULL)).
 void actor_gc_set_current(actor_gc_arena_t *arena);
-
-// Get the current thread's active arena. Returns NULL if no actor is executing.
 actor_gc_arena_t *actor_gc_get_current(void);
 
-// --- Promote arena objects to Boehm heap ---
+// --- Legacy promote API (kept for fallback) ---
 
-// Conservatively scan a memory region for arena pointers. For each arena
-// pointer found, copy the object to the Boehm heap and update the pointer
-// in-place. Recurses into promoted objects to handle transitive references.
-// This is used before message delivery to ensure the receiving actor doesn't
-// hold dangling references into the sender's arena.
 void actor_gc_promote_region(void *start, size_t size);
-
-// Promote a single arena-allocated object to Boehm. Returns the new Boehm
-// pointer. Recursively promotes any arena pointers within the object.
 void *actor_gc_promote_one(void *arena_ptr);
 
-// Header/payload helpers
+// --- Header/payload helpers ---
+
 static inline actor_gc_obj_t *actor_gc_header(void *ptr) {
     return (actor_gc_obj_t *)((char *)ptr - sizeof(actor_gc_obj_t));
 }

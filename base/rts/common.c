@@ -109,6 +109,13 @@ int acton_replace_allocator(acton_malloc_func malloc_func,
 }
 
 void* acton_malloc(size_t size) {
+    // Route to per-actor arena when an actor is executing
+    actor_gc_arena_t *arena = actor_gc_get_current();
+    if (arena) {
+        void *p = actor_gc_alloc(arena, size);
+        if (p) return p;
+        // Fall through to Boehm if arena region exhausted
+    }
     return acton__allocator.calloc(1, size);
 }
 
@@ -116,11 +123,8 @@ void* acton_malloc_atomic(size_t size) {
     return acton__allocator.malloc_atomic(size);
 }
 
-// Allocate from per-actor arena if available, otherwise from Boehm atomic.
-// Use this ONLY for leaf objects that contain no outgoing GC pointers
-// (e.g., B_int, B_float — only have a static vtable pointer and scalar data).
-// Since leaf objects don't reference GC-managed memory, Boehm doesn't need
-// to scan them, and they don't need to be registered as roots.
+// Arena-aware allocation for leaf objects (no outgoing GC pointers).
+// Same as acton_malloc but could set AGC_FLAG_LEAF in the future.
 void* acton_malloc_leaf(size_t size) {
     actor_gc_arena_t *arena = actor_gc_get_current();
     if (arena) {
@@ -131,10 +135,14 @@ void* acton_malloc_leaf(size_t size) {
 }
 
 void* acton_realloc(void* ptr, size_t size) {
-    // Safety: arena pointers must never be passed to GC_realloc.
-    // With leaf-only arena allocation, this shouldn't happen (leaf types
-    // don't use realloc), but guard against it.
+    // Arena pointer: realloc within arena if actor is executing
     if (ptr && actor_gc_is_arena_ptr(ptr)) {
+        actor_gc_arena_t *arena = actor_gc_get_current();
+        if (arena) {
+            void *p = actor_gc_realloc(arena, ptr, size);
+            if (p) return p;
+        }
+        // Arena exhausted or not in actor context: copy to Boehm
         void *boehm_ptr = acton__allocator.calloc(1, size);
         if (boehm_ptr) {
             size_t old_size = actor_gc_obj_size(ptr);
