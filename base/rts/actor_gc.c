@@ -312,16 +312,34 @@ void *actor_gc_alloc(actor_gc_arena_t *arena, size_t size) {
     size_t aligned_size = ALIGN_UP(size, ARENA_ALIGN);
     size_t total = sizeof(actor_gc_obj_t) + aligned_size;
 
-    // Free list reuse is disabled pending a complete ext_refcount fix.
-    // Several code paths (FREEZE_waiting, $RFAIL propagation, etc.) can place
-    // arena pointers into messages without going through track_outgoing_refs,
-    // causing ext_refcount to be 0 at sweep time even though the object is still
-    // referenced.  Without correct ext_refcount the sentinel-based use-after-free
-    // detection fires. Re-enable once all ref-tracking paths are audited.
-    // (The free_list is still populated by the sweep so free_bytes stays accurate
-    // for threshold decisions; we just don't consume it here.)
+    // 1. Try free list (head-only, LIFO): reuse if head block is large enough.
+    actor_gc_obj_t *blk = arena->free_list;
+    if (blk && blk->size >= aligned_size) {
+        arena->free_list = blk->next;
+        arena->free_bytes -= blk->size;
 
-    // Bump allocate from global region
+        // Reinitialize header. Keep blk->size at the original physical size.
+        uint32_t reuse_size = blk->size;
+        blk->owner = arena;
+        blk->flags = 0;
+        blk->ext_refcount = 0;
+
+        blk->next = arena->objects;
+        arena->objects = blk;
+        arena->total_bytes += reuse_size;
+        arena->num_objects++;
+
+        void *payload = actor_gc_payload(blk);
+        memset(payload, 0, reuse_size);
+        // Verify sentinel was cleared
+        if (reuse_size >= sizeof(uint64_t) && *(uint64_t *)payload == AGC_FREELIST_SENTINEL) {
+            fprintf(stderr, "AGC: memset failed to clear sentinel at %p!\n", payload);
+            abort();
+        }
+        return payload;
+    }
+
+    // 2. Bump allocate from global region
     void *block = region_bump_alloc(total);
     if (!block) return NULL;
 
@@ -717,13 +735,25 @@ void actor_gc_collect_full(actor_gc_arena_t *arena, actor_gc_root_t *roots, int 
                 }
             }
 
-            // Remove from objects list. Free list reuse is disabled so we
-            // simply unlink the object (it leaks into the arena region).
-            // No sentinel written; no free_list prepend.
+            // Remove from objects list and add to free list for reuse.
             *prev = next;
             freed += obj->size;
             freed_count++;
-            // (free_bytes not updated since free list is not being consumed)
+            arena->free_bytes += obj->size;
+
+            // Write sentinel for corruption detection on reuse
+            if (obj->size >= sizeof(uint64_t)) {
+                *(uint64_t *)actor_gc_payload(obj) = AGC_FREELIST_SENTINEL;
+            }
+
+            // Record in sweep ring for diagnostics
+            agc_sweep_ring[agc_sweep_ring_idx] = actor_gc_payload(obj);
+            agc_sweep_ring_arena[agc_sweep_ring_idx] = arena;
+            agc_sweep_ring_idx = (agc_sweep_ring_idx + 1) % AGC_SWEEP_RING_SIZE;
+            agc_sweep_ring_total++;
+
+            obj->next = arena->free_list;
+            arena->free_list = obj;
         }
         obj = next;
     }
