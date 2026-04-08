@@ -2472,6 +2472,12 @@ int main(int argc, char **argv) {
     if (actor_gc_global_init(0) != 0) {
         fprintf(stderr, "WARNING: actor_gc_global_init failed, falling back to Boehm-only\n");
     }
+    // ACTON_NO_ARENA=1 disables arena allocation (forces Boehm-only) for benchmarking
+    extern int acton_no_arena;
+    const char *no_arena_env = getenv("ACTON_NO_ARENA");
+    if (no_arena_env && no_arena_env[0] == '1') {
+        acton_no_arena = 1;
+    }
     int ddb_no_host = 0;
     char **ddb_host = NULL;
     char *rts_host = "localhost";

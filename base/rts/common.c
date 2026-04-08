@@ -108,8 +108,12 @@ int acton_replace_allocator(acton_malloc_func malloc_func,
     return 0;
 }
 
+// Set by rts.c init when ACTON_NO_ARENA=1 — forces all alloc through Boehm
+int acton_no_arena = 0;
+
 void* acton_malloc(size_t size) {
     // Route to per-actor arena when an actor is executing
+    if (acton_no_arena) return acton__allocator.calloc(1, size);
     actor_gc_arena_t *arena = actor_gc_get_current();
     if (arena) {
         void *p = actor_gc_alloc(arena, size);
@@ -124,6 +128,7 @@ void *actor_gc_alloc_leaf(actor_gc_arena_t *arena, size_t size);
 
 void* acton_malloc_atomic(size_t size) {
     // Route atomic (leaf) allocations to arena — reduces Boehm GC pressure.
+    if (acton_no_arena) return acton__allocator.malloc_atomic(size);
     actor_gc_arena_t *arena = actor_gc_get_current();
     if (arena) {
         void *p = actor_gc_alloc_leaf(arena, size);
@@ -135,6 +140,7 @@ void* acton_malloc_atomic(size_t size) {
 
 // Arena-aware allocation for leaf objects (no outgoing GC pointers).
 void* acton_malloc_leaf(size_t size) {
+    if (acton_no_arena) return acton__allocator.calloc(1, size);
     actor_gc_arena_t *arena = actor_gc_get_current();
     if (arena) {
         void *p = actor_gc_alloc_leaf(arena, size);
