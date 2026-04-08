@@ -93,13 +93,16 @@ int acton_replace_allocator(acton_malloc_func malloc_func,
     acton__allocator.strdup = strdup_func;
     acton__allocator.strndup = strndup_func;
 
+    // Use acton_realloc (arena-aware) for bsdnt and xml. They may receive
+    // arena pointers from bigint/string allocations and pass them back to
+    // realloc. Without this wrapper, GC_realloc crashes on arena pointers.
     bsdnt_replace_allocator(acton__allocator.malloc,
-                            acton__allocator.realloc,
+                            acton_realloc,
                             acton__allocator.free);
 
     xmlMemSetup(acton__allocator.free,
                 acton__allocator.malloc,
-                acton__allocator.realloc,
+                acton_realloc,
                 acton__allocator.strdup);
 
     mbedtls_platform_set_calloc_free(acton__allocator.calloc,
