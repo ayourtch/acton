@@ -168,7 +168,16 @@ int actor_gc_global_init(size_t size) {
 }
 
 bool actor_gc_is_arena_ptr(void *ptr) {
-    return region_base && ptr >= (void *)region_base && ptr < (void *)region_end;
+    if (!region_base) return false;
+    if (ptr < (void *)region_base || ptr >= (void *)region_end) return false;
+    // Real arena payload pointers always satisfy (addr & 0xF) == 0x8:
+    //   - Allocations are 16-byte aligned (ARENA_ALIGN = 16)
+    //   - Object header is 24 bytes, so payload offset is 24 = 16 + 8
+    //   - Therefore payload_addr = (16N) + 24 = (16M) + 8
+    // This rejects misaligned values from conservative scanning that
+    // happen to fall in the arena region.
+    if (((uintptr_t)ptr & 0xF) != 0x8) return false;
+    return true;
 }
 
 // --- Arena lifecycle ---
