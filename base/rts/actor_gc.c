@@ -512,6 +512,11 @@ static bool mark_range(actor_gc_arena_t *arena, void *start, size_t size,
 
 static void mark_from_roots_bfs(actor_gc_arena_t *arena,
                                   actor_gc_root_t *roots, int num_roots) {
+    // Prevent Boehm from collecting during BFS. Without this, Boehm can
+    // collect objects between discovery (GC_base) and scanning, causing
+    // stale memory reads that miss arena pointers → live objects swept → crash.
+    GC_disable();
+
     // Boehm visited hash table — starts small, grows dynamically (see mark_range)
     int boehm_ht_cap = 512;
     void **boehm_ht = (void **)calloc(boehm_ht_cap, sizeof(void *));
@@ -613,6 +618,7 @@ static void mark_from_roots_bfs(actor_gc_arena_t *arena,
     }
 
 cleanup:
+    GC_enable();
     free(boehm_ht);
     free(arena_wl);
     free(boehm_wl);
