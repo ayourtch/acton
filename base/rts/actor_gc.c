@@ -259,8 +259,41 @@ static inline void *arena_alloc_internal(actor_gc_arena_t *arena, size_t size, u
     size_t aligned_size = ALIGN_UP(size, ARENA_ALIGN);
     size_t total = sizeof(actor_gc_obj_t) + aligned_size;
 
-    // Free list reuse disabled — causes intermittent corruption (race condition
-    // between ENQ_msg and GC sweep). Limbo cycle not sufficient.
+    // Try free list first (best-fit from previously collected objects).
+    // Objects go sweep→limbo→free_list with ext_refcount check at promotion.
+    {
+        actor_gc_obj_t **prev_free = &arena->free_list;
+        actor_gc_obj_t *cur = arena->free_list;
+        while (cur) {
+            if (cur->size >= aligned_size) {
+                // Check sentinel for corruption detection
+                if (cur->size >= sizeof(uint64_t)) {
+                    uint64_t sentinel = *(uint64_t *)actor_gc_payload(cur);
+                    if (sentinel != AGC_FREELIST_SENTINEL) {
+                        // Corrupted block — skip it
+                        prev_free = &cur->next;
+                        cur = cur->next;
+                        continue;
+                    }
+                }
+                // Remove from free list
+                *prev_free = cur->next;
+                arena->free_bytes -= cur->size;
+                // Re-initialize and add to objects list
+                cur->flags = flags;
+                cur->ext_refcount = 0;
+                cur->next = arena->objects;
+                arena->objects = cur;
+                arena->num_objects++;
+                arena->total_bytes += cur->size;
+                // Zero the payload
+                memset(actor_gc_payload(cur), 0, cur->size);
+                return actor_gc_payload(cur);
+            }
+            prev_free = &cur->next;
+            cur = cur->next;
+        }
+    }
 
     // Per-arena bump (TLAB): try local chunk first, no atomics needed.
     // Actors are single-threaded during execution, so this is safe.
@@ -653,21 +686,30 @@ void actor_gc_collect_full(actor_gc_arena_t *arena, actor_gc_root_t *roots, int 
 
     arena->collections++;
 
-    // Phase 0a: Promote limbo → free_list.
+    // Phase 0a: Promote limbo → free_list (with ext_refcount check).
     // Objects in limbo were swept in the PREVIOUS collection cycle.
-    // One full cycle has elapsed, so any concurrent ENQ_msg + track_outgoing_refs
-    // that referenced these objects has completed by now.
+    // Check ext_refcount: if another actor acquired a reference since the
+    // sweep (via track_outgoing_refs), rescue the object back to live list.
     {
         actor_gc_obj_t *limbo_obj = arena->limbo;
         while (limbo_obj) {
             actor_gc_obj_t *next = limbo_obj->next;
-            // Write sentinel now that the object is truly safe to reuse
-            if (limbo_obj->size >= sizeof(uint64_t)) {
-                *(uint64_t *)actor_gc_payload(limbo_obj) = AGC_FREELIST_SENTINEL;
+            if (__sync_fetch_and_add(&limbo_obj->ext_refcount, 0) > 0) {
+                // Object was referenced by another actor since sweep.
+                // Rescue: put back on live objects list.
+                limbo_obj->next = arena->objects;
+                arena->objects = limbo_obj;
+                arena->num_objects++;
+                arena->total_bytes += limbo_obj->size;
+            } else {
+                // Truly dead: promote to free_list for reuse.
+                if (limbo_obj->size >= sizeof(uint64_t)) {
+                    *(uint64_t *)actor_gc_payload(limbo_obj) = AGC_FREELIST_SENTINEL;
+                }
+                limbo_obj->next = arena->free_list;
+                arena->free_list = limbo_obj;
+                arena->free_bytes += limbo_obj->size;
             }
-            limbo_obj->next = arena->free_list;
-            arena->free_list = limbo_obj;
-            arena->free_bytes += limbo_obj->size;
             limbo_obj = next;
         }
         arena->limbo = NULL;
