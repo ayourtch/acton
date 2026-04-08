@@ -73,6 +73,10 @@ struct actor_gc_arena {
     void **boehm_pin_set;           // GC_malloc'd array (Boehm sees it as root)
     size_t pin_set_count;           // number of pinned Boehm pointers
     size_t pin_set_cap;             // allocated capacity
+    // Per-arena bump chunk (TLAB): avoids global atomic CAS on every allocation.
+    // Each arena gets a private region chunk and bumps within it lock-free.
+    char *local_bump;               // current bump position in local chunk
+    char *local_bump_end;           // end of local chunk
     // Foreign reference tracking
     void **foreign_refs;            // array of foreign arena ptrs this actor references
     int foreign_refs_count;         // current count

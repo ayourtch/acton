@@ -18,7 +18,7 @@ static volatile char *bump_ptr = NULL;
 
 #define DEFAULT_REGION_SIZE (8UL * 1024 * 1024 * 1024)
 
-#define INITIAL_THRESHOLD (64 * 1024 * 1024)
+#define INITIAL_THRESHOLD (4 * 1024 * 1024)
 #define THRESHOLD_GROWTH 2
 #define MIN_RECLAIM_RATIO 0.25
 
@@ -152,9 +152,13 @@ int actor_gc_global_init(size_t size) {
         actor_gc_no_roots = 0;
     }
 
-    fprintf(stderr, "ACTOR_GC: region %p - %p (%zu MB)%s\n",
-            region_base, region_end, size / (1024*1024),
-            actor_gc_no_roots ? " [pin set mode]" : " [root scanning ON]");
+    // Only print banner when ACTON_GC_DEBUG=1 to avoid breaking tests that check stderr
+    const char *debug_env = getenv("ACTON_GC_DEBUG");
+    if (debug_env && debug_env[0] == '1') {
+        fprintf(stderr, "ACTOR_GC: region %p - %p (%zu MB)%s\n",
+                region_base, region_end, size / (1024*1024),
+                actor_gc_no_roots ? " [pin set mode]" : " [root scanning ON]");
+    }
     return 0;
 }
 
@@ -181,6 +185,8 @@ void actor_gc_arena_init(actor_gc_arena_t *arena) {
     arena->boehm_pin_set = NULL;
     arena->pin_set_count = 0;
     arena->pin_set_cap = 0;
+    arena->local_bump = NULL;
+    arena->local_bump_end = NULL;
     arena->foreign_refs = NULL;
     arena->foreign_refs_count = 0;
     arena->foreign_refs_cap = 0;
@@ -243,6 +249,10 @@ static void *region_bump_alloc(size_t total_size) {
 #define AGC_FREELIST_SENTINEL 0xDEADB00FDEADBA11ULL
 
 
+// Per-arena TLAB chunk size: each arena gets a private chunk from the global
+// region and bumps within it without any atomics. One global CAS per chunk.
+#define TLAB_CHUNK_SIZE (256 * 1024)  // 256KB per chunk
+
 static inline void *arena_alloc_internal(actor_gc_arena_t *arena, size_t size, uint16_t flags) {
     if (!region_base) return NULL;
 
@@ -252,13 +262,25 @@ static inline void *arena_alloc_internal(actor_gc_arena_t *arena, size_t size, u
     // Free list reuse disabled — causes intermittent corruption (race condition
     // between ENQ_msg and GC sweep). Limbo cycle not sufficient.
 
-    // Bump allocate from global region
-    void *block = region_bump_alloc(total);
-    if (!block) return NULL;
-
-    memset(block, 0, total);
+    // Per-arena bump (TLAB): try local chunk first, no atomics needed.
+    // Actors are single-threaded during execution, so this is safe.
+    void *block = NULL;
+    if (arena->local_bump && arena->local_bump + total <= arena->local_bump_end) {
+        block = arena->local_bump;
+        arena->local_bump += ALIGN_UP(total, ARENA_ALIGN);
+    } else {
+        // Local chunk exhausted or not yet allocated: grab a new one.
+        // Use a chunk at least as big as the requested allocation.
+        size_t chunk_sz = total > TLAB_CHUNK_SIZE ? ALIGN_UP(total, ARENA_ALIGN) : TLAB_CHUNK_SIZE;
+        char *chunk = (char *)region_bump_alloc(chunk_sz);
+        if (!chunk) return NULL;
+        block = chunk;
+        arena->local_bump = chunk + ALIGN_UP(total, ARENA_ALIGN);
+        arena->local_bump_end = chunk + chunk_sz;
+    }
 
     actor_gc_obj_t *obj = (actor_gc_obj_t *)block;
+    obj->next = NULL;
     obj->size = (uint32_t)aligned_size;
     obj->owner = arena;
     obj->flags = flags;
@@ -466,14 +488,18 @@ static bool mark_range(actor_gc_arena_t *arena, void *start, size_t size,
                 }
                 int ins = boehm_ht_insert(*boehm_ht, *boehm_ht_cap, gb);
                 if (ins == 1) {
-                    // Newly visited: push to Boehm worklist
-                    if (*boehm_wl_n >= *boehm_wl_cap) {
+                    // Newly visited: push (base, size) pair to Boehm worklist.
+                    // Capture GC_size now while the object is known-valid, to
+                    // avoid calling GC_size later when it may have been collected.
+                    size_t bsz = GC_size(gb);
+                    if (*boehm_wl_n + 1 >= *boehm_wl_cap) {
                         int nc = *boehm_wl_cap * 2;
                         void **nw = (void **)realloc(*boehm_wl, nc * sizeof(void *));
                         if (!nw) return false;
                         *boehm_wl = nw; *boehm_wl_cap = nc;
                     }
                     (*boehm_wl)[(*boehm_wl_n)++] = gb;
+                    (*boehm_wl)[(*boehm_wl_n)++] = (void *)bsz;
                 } else if (ins == -1) {
                     (*boehm_ht_overflow)++;
                 }
@@ -540,10 +566,10 @@ static void mark_from_roots_bfs(actor_gc_arena_t *arena,
                             &boehm_wl, &boehm_wl_n, &boehm_wl_cap,
                             &boehm_ht, &boehm_ht_cap, &boehm_ht_overflow)) goto cleanup;
         }
-        // Process one Boehm object (which may enqueue more arena/Boehm objects)
+        // Process one Boehm object (stored as (base, size) pair)
         if (boehm_wl_head < boehm_wl_n) {
             void *base = boehm_wl[boehm_wl_head++];
-            size_t bsz = GC_size(base);
+            size_t bsz = (size_t)boehm_wl[boehm_wl_head++];
             if (!mark_range(arena, base, bsz,
                             &arena_wl, &arena_wl_n, &arena_wl_cap,
                             &boehm_wl, &boehm_wl_n, &boehm_wl_cap,
@@ -551,24 +577,28 @@ static void mark_from_roots_bfs(actor_gc_arena_t *arena,
         }
     }
 
+    int boehm_unique = boehm_wl_n / 2;  // worklist stores (base, size) pairs
+
     if (boehm_ht_overflow > 0) {
         fprintf(stderr, "AGC BUG: boehm_ht overflow %d time(s) during BFS "
                 "(final cap=%d, boehm_unique=%d) — objects may have been missed!\n",
-                boehm_ht_overflow, boehm_ht_cap, boehm_wl_n);
+                boehm_ht_overflow, boehm_ht_cap, boehm_unique);
     }
 
-    // Build pin set: all unique Boehm objects discovered during BFS.
+    // Build pin set: extract base pointers from (base, size) pairs.
     // Allocated via GC_malloc so Boehm sees the pointers and keeps the objects alive.
-    if (boehm_wl_n > 0) {
-        size_t need = (size_t)boehm_wl_n;
+    if (boehm_unique > 0) {
+        size_t need = (size_t)boehm_unique;
         if (need > arena->pin_set_cap) {
-            // Round up to power of 2 for growth
             size_t cap = arena->pin_set_cap ? arena->pin_set_cap : 64;
             while (cap < need) cap *= 2;
             arena->boehm_pin_set = (void **)GC_malloc(cap * sizeof(void *));
             arena->pin_set_cap = cap;
         }
-        memcpy(arena->boehm_pin_set, boehm_wl, need * sizeof(void *));
+        // Extract base pointers (every other entry)
+        for (int i = 0; i < boehm_unique; i++) {
+            arena->boehm_pin_set[i] = boehm_wl[i * 2];
+        }
         arena->pin_set_count = need;
         // Zero out the rest so Boehm doesn't see stale pointers
         if (need < arena->pin_set_cap) {
